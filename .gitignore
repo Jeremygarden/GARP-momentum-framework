@@ -1,0 +1,5 @@
+# Git ignore for workspace-investor
+.openclaw/
+memory/
+*.log
+*.json.bak
