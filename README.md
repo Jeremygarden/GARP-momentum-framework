@@ -17,12 +17,12 @@ A股/港股成长股筛选与评分框架，基于 GARP（Growth at a Reasonable
 
 ```
 skills/
-├── master-trading-analysis/          # 综合投资分析框架（12位大师+量化）
+├── master-trading-analysis/          # 综合投资分析框架
 │   ├── SKILL.md
 │   └── references/
 │       ├── garp-quality-momentum/    # GARP v2.0 核心模型
 │       │   ├── README.md             # 框架概述+权重+评分公式
-│       │   ├── execution-sop.md      # 执行SOP（数据获取/评分/入库/榜单输出）
+│       │   ├── execution-sop.md      # 执行SOP（数据获取/评分/入库/榜单/技术确认/观察池）
 │       │   ├── market-regime.md      # 市场状态判断+动态权重+PEG/股息率切换
 │       │   ├── layer1-sector.md      # 赛道景气筛选
 │       │   ├── layer2-quality.md     # 盈利质量评分（分行业）
@@ -30,7 +30,6 @@ skills/
 │       │   ├── layer4-risk.md        # 风险一票否决+加减分
 │       │   ├── layer5-momentum.md    # 价格+盈利修正动量
 │       │   └── improvement.md        # 改进记录
-│       ├── analysts/                 # 12位投资大师分析模块
 │       ├── fundamentals.md
 │       ├── technicals.md
 │       ├── valuation.md
