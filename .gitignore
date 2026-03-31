@@ -3,3 +3,8 @@
 memory/
 *.log
 *.json.bak
+
+# 仅本地保留，不推送到远程
+skills/stock-kb/
+skills/mx-skills/
+skills/ai-trader/
