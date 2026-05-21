@@ -92,8 +92,11 @@ def eastmoney_datacenter(
     page_size: int = 50,
     sort_columns: str = "",
     sort_types: str = "-1",
+    retries: int = 3,
 ) -> list[dict]:
-    """东财数据中心统一查询 helper（龙虎榜/解禁/融资融券/大宗/股东户数共用）"""
+    """东财数据中心统一查询 helper（龙虎榜/解禁/融资融券/大宗/股东户数共用）
+    retries: 超时自动重试次数（Azure→东财偶发超时，默认重试3次）
+    """
     params = {
         "reportName": report_name,
         "columns": columns,
@@ -105,16 +108,28 @@ def eastmoney_datacenter(
         "source": "WEB",
         "client": "WEB",
     }
-    r = requests.get(
-        DATACENTER_URL,
-        params=params,
-        headers={"User-Agent": UA},
-        timeout=15,
-    )
-    d = r.json()
-    if d.get("result") and d["result"].get("data"):
-        return d["result"]["data"]
-    return []
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(
+                DATACENTER_URL,
+                params=params,
+                headers={"User-Agent": UA},
+                timeout=20,
+            )
+            d = r.json()
+            if d.get("result") and d["result"].get("data"):
+                return d["result"]["data"]
+            return []
+        except requests.exceptions.Timeout:
+            if attempt < retries:
+                print(f"[WARN] 东财 datacenter 超时，第{attempt}次重试...")
+                time.sleep(2 * attempt)
+            else:
+                print(f"[ERROR] 东财 datacenter 超时，已重试{retries}次，放弃: {report_name}")
+                return []
+        except Exception as e:
+            print(f"[ERROR] 东财 datacenter 异常: {e}")
+            return []
 
 
 # ─────────────────────────────────────────
@@ -151,14 +166,15 @@ def get_fund_flow_minute(code: str, fallback_thsdk: bool = True) -> list[dict]:
         for line in d.get("data", {}).get("klines", []):
             parts = line.split(",")
             if len(parts) >= 6:
-                # push2 原始单位：元 → 换算为万元
+                # push2 原始单位：元（每分钟增量）
+                # 保留元级精度，汇总层统一换算为万元
                 rows.append({
                     "time": parts[0],
-                    "main_net_wan": round(float(parts[1]) / 10000, 2),
-                    "small_net_wan": round(float(parts[2]) / 10000, 2),
-                    "mid_net_wan": round(float(parts[3]) / 10000, 2),
-                    "large_net_wan": round(float(parts[4]) / 10000, 2),
-                    "super_net_wan": round(float(parts[5]) / 10000, 2),
+                    "main_net_yuan": float(parts[1]),
+                    "small_net_yuan": float(parts[2]),
+                    "mid_net_yuan": float(parts[3]),
+                    "large_net_yuan": float(parts[4]),
+                    "super_net_yuan": float(parts[5]),
                 })
         if rows:
             return rows
@@ -186,11 +202,11 @@ def _thsdk_fund_flow_fallback(code: str) -> list[dict]:
         for item in result if isinstance(result, list) else []:
             rows.append({
                 "time": item.get("time", ""),
-                "main_net_wan": round(float(item.get("main_net", 0)) / 10000, 2),
-                "large_net_wan": round(float(item.get("large_net", 0)) / 10000, 2),
-                "mid_net_wan": 0.0,   # thsdk 不拆分中单
-                "small_net_wan": round(float(item.get("small_net", 0)) / 10000, 2),
-                "super_net_wan": 0.0, # thsdk 不单独标注超大单
+                "main_net_yuan": float(item.get("main_net", 0)),
+                "large_net_yuan": float(item.get("large_net", 0)),
+                "mid_net_yuan": 0.0,
+                "small_net_yuan": float(item.get("small_net", 0)),
+                "super_net_yuan": 0.0,
                 "_source": "thsdk_fallback",
             })
         return rows
@@ -204,15 +220,18 @@ def get_fund_flow_summary(code: str) -> dict:
     资金流汇总（当日累计），供 GARP Layer4 快速判断。
     返回: {main_total_wan, signal, source}
     signal: 'bullish' / 'bearish' / 'neutral'
+    阈值：主力净流入 > +500万 = bullish；< -500万 = bearish
     """
     rows = get_fund_flow_minute(code)
     if not rows:
         return {"main_total_wan": 0, "signal": "neutral", "source": "none"}
-    total = sum(r["main_net_wan"] for r in rows)
+    # 元级累加后统一换算为万元
+    total_yuan = sum(r["main_net_yuan"] for r in rows)
+    total_wan = round(total_yuan / 10000, 1)
     source = rows[0].get("_source", "eastmoney_push2")
-    signal = "bullish" if total > 500 else ("bearish" if total < -500 else "neutral")
+    signal = "bullish" if total_wan > 500 else ("bearish" if total_wan < -500 else "neutral")
     return {
-        "main_total_wan": round(total, 1),
+        "main_total_wan": total_wan,
         "signal": signal,
         "source": source,
     }
@@ -548,6 +567,17 @@ def cls_keyword_alert(
 # 6. 巨潮公告（直连 cninfo）
 # ─────────────────────────────────────────
 
+def _ts_to_date(ts) -> str:
+    """毫秒时间戳 → YYYY-MM-DD（兼容 int 和字符串格式）"""
+    if ts is None:
+        return ""
+    try:
+        ts_int = int(ts)
+        return datetime.fromtimestamp(ts_int / 1000).strftime("%Y-%m-%d")
+    except Exception:
+        return str(ts)[:10]
+
+
 def get_cninfo_announcements(
     code: str,
     page_size: int = 20,
@@ -561,11 +591,11 @@ def get_cninfo_announcements(
     返回: [{date, title, url, type}]
     """
     c = normalize_code(code)
-    # 判断交易所
+    # 判断交易所（V3.1 修复：orgId 格式为 gssh0{code} / gssz0{code}）
     if c.startswith(("6", "9")):
-        org_id = f"gssh{c}"
+        org_id = f"gssh0{c}"
     else:
-        org_id = f"gssz{c}"
+        org_id = f"gssz0{c}"
 
     url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
     data = {
@@ -593,13 +623,13 @@ def get_cninfo_announcements(
         r = requests.post(url, data=data, headers=headers, timeout=15)
         d = r.json()
         rows = []
-        for item in d.get("announcements") or []:
+        for row in d.get("announcements") or []:
             rows.append({
-                "date": item.get("announcementTime", "")[:10],
-                "title": item.get("announcementTitle", ""),
-                "url": f"https://static.cninfo.com.cn/{item.get('adjunctUrl', '')}",
-                "type": item.get("announcementTypeName", ""),
-                "id": item.get("announcementId", ""),
+                "date": _ts_to_date(row.get("announcementTime")),
+                "title": row.get("announcementTitle", ""),
+                "url": f"https://static.cninfo.com.cn/{row.get('adjunctUrl', '')}",
+                "type": row.get("announcementTypeName", ""),
+                "id": row.get("announcementId", ""),
             })
         return rows
     except Exception as e:
@@ -679,8 +709,9 @@ def layer4_risk_check(
     elif lockup["risk_label"] == "medium":
         caution_reasons.append("限售解禁比例1-5%（中风险）")
 
-    if fund_flow["signal"] == "bearish" and fund_flow["main_total_wan"] < -2000:
-        caution_reasons.append(f"主力资金净流出{abs(fund_flow['main_total_wan'])}万")
+    if fund_flow["signal"] == "bearish" and fund_flow["main_total_wan"] < -5000:
+        yi = abs(fund_flow["main_total_wan"]) / 10000
+        caution_reasons.append(f"主力资金净流出 {yi:.1f}亿")
 
     if cls_alerts:
         keywords = [kw for a in cls_alerts for kw in a.get("matched_keywords", [])]
@@ -752,16 +783,22 @@ if __name__ == "__main__":
 
     # 2. 限售解禁
     print(f"\n[2] 限售解禁日历 — {TEST_CODE}")
-    lockup = get_lockup_expiry(TEST_CODE, TODAY)
-    print(f"  风险等级: {lockup['risk_label']}")
-    print(f"  未来90天解禁批次: {len(lockup['upcoming'])}")
+    try:
+        lockup = get_lockup_expiry(TEST_CODE, TODAY)
+        print(f"  风险等级: {lockup['risk_label']}")
+        print(f"  未来90天解禁批次: {len(lockup['upcoming'])}")
+    except Exception as e:
+        print(f"  ❌ 失败: {e}")
 
     # 3. 龙虎榜
     print(f"\n[3] 龙虎榜 — {TEST_CODE}")
-    dt = get_dragon_tiger(TEST_CODE, TODAY)
-    print(f"  近30日上榜次数: {len(dt['records'])}")
-    print(f"  机构净买入: {dt['institution']['net_wan']}万")
-    print(f"  Layer4信号: {dt['layer4_signal']}")
+    try:
+        dt = get_dragon_tiger(TEST_CODE, TODAY)
+        print(f"  近30日上榜次数: {len(dt['records'])}")
+        print(f"  机构净买入: {dt['institution']['net_wan']}万")
+        print(f"  Layer4信号: {dt['layer4_signal']}")
+    except Exception as e:
+        print(f"  ❌ 失败: {e}")
 
     # 4. 东财研报
     print(f"\n[4] 东财研报（前3条）— {TEST_CODE}")
