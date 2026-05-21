@@ -755,6 +755,193 @@ def layer4_risk_check(
 
 
 # ─────────────────────────────────────────
+# 腾讯财经实时行情（PE/PB/估值层）
+# ─────────────────────────────────────────
+
+def tencent_quote(codes: list[str]) -> dict[str, dict]:
+    """
+    腾讯财经实时行情（估值层）。
+    覆盖：PE(TTM)/PE(静态)/PB/总市值/流通市值/换手率/涨跌停价/量比/振幅
+    codes: 纯6位代码列表，如 ["600519", "000858"]
+    返回: {code: {name, price, pe_ttm, pe_static, pb, mcap_yi, ...}}
+    """
+    import urllib.request
+
+    prefixed = []
+    for c in codes:
+        nc = normalize_code(c)
+        if nc.startswith(("6", "9")):
+            prefixed.append(f"sh{nc}")
+        elif nc.startswith("8"):
+            prefixed.append(f"bj{nc}")
+        else:
+            prefixed.append(f"sz{nc}")
+
+    url = "https://qt.gtimg.cn/q=" + ",".join(prefixed)
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", UA)
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = resp.read().decode("gbk")
+    except Exception as e:
+        print(f"[ERROR] 腾讯财经请求失败: {e}")
+        return {}
+
+    result = {}
+    for line in data.strip().split(";"):
+        if not line.strip() or "=" not in line or '"' not in line:
+            continue
+        key = line.split("=")[0].split("_")[-1]
+        vals = line.split('"')[1].split("~")
+        if len(vals) < 53:
+            continue
+        code = key[2:]
+        result[code] = {
+            "name":          vals[1],
+            "price":         float(vals[3]) if vals[3] else 0,
+            "last_close":    float(vals[4]) if vals[4] else 0,
+            "open":          float(vals[5]) if vals[5] else 0,
+            "change_amt":    float(vals[31]) if vals[31] else 0,
+            "change_pct":    float(vals[32]) if vals[32] else 0,
+            "high":          float(vals[33]) if vals[33] else 0,
+            "low":           float(vals[34]) if vals[34] else 0,
+            "amount_wan":    float(vals[37]) if vals[37] else 0,
+            "turnover_pct":  float(vals[38]) if vals[38] else 0,
+            "pe_ttm":        float(vals[39]) if vals[39] else 0,
+            "amplitude_pct": float(vals[43]) if vals[43] else 0,   # 振幅%（非PB！）
+            "mcap_yi":       float(vals[44]) if vals[44] else 0,   # 总市值（亿）
+            "float_mcap_yi": float(vals[45]) if vals[45] else 0,   # 流通市值（亿）
+            "pb":            float(vals[46]) if vals[46] else 0,   # PB（索引46，非43）
+            "limit_up":      float(vals[47]) if vals[47] else 0,   # 涨停价
+            "limit_down":    float(vals[48]) if vals[48] else 0,   # 跌停价
+            "vol_ratio":     float(vals[49]) if vals[49] else 0,   # 量比
+            "pe_static":     float(vals[52]) if vals[52] else 0,   # PE静态
+        }
+    return result
+
+
+# ─────────────────────────────────────────
+# 东财 push2 个股基础信息
+# ─────────────────────────────────────────
+
+def eastmoney_stock_info(code: str) -> dict:
+    """
+    东财 push2 个股基础信息（资金流层补充）。
+    覆盖：行业/总股本/流通股/总市值/上市日期
+    """
+    secid = get_secid(code)
+    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    params = {
+        "secid": secid,
+        "fields": "f57,f58,f84,f85,f116,f117,f127,f189",
+        # f57=代码 f58=名称 f84=总股本 f85=流通股 f116=总市值 f117=流通市值
+        # f127=行业 f189=上市日期
+    }
+    headers = {"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        d = r.json().get("data", {})
+        return {
+            "code":          d.get("f57", ""),
+            "name":          d.get("f58", ""),
+            "total_shares":  d.get("f84", 0),    # 总股本（股）
+            "float_shares":  d.get("f85", 0),    # 流通股（股）
+            "mcap_yuan":     d.get("f116", 0),   # 总市值（元）
+            "float_mcap_yuan": d.get("f117", 0), # 流通市值（元）
+            "industry":      d.get("f127", ""),  # 行业（东财分类）
+            "list_date":     d.get("f189", ""),  # 上市日期
+        }
+    except Exception as e:
+        print(f"[ERROR] 东财 stock_info 失败: {e}")
+        return {}
+
+
+# ─────────────────────────────────────────
+# PE/PB 双源交叉校验
+# ─────────────────────────────────────────
+
+def cross_validate_valuation(code: str) -> dict:
+    """
+    PE/PB 双源交叉校验：腾讯财经 vs 东财 push2。
+    用于发现数据延迟或异常，差异 > 5% 时打 warning。
+
+    返回: {
+        tencent: {pe_ttm, pb, mcap_yi},
+        eastmoney: {pe_ttm, pb, mcap_yi},
+        pe_diff_pct: float,
+        pb_diff_pct: float,
+        mcap_diff_pct: float,
+        warnings: list[str],
+        consistent: bool
+    }
+    """
+    # 腾讯数据
+    tc = tencent_quote([normalize_code(code)])
+    tencent = tc.get(normalize_code(code), {})
+
+    # 东财 push2 估值字段
+    secid = get_secid(code)
+    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    params = {
+        "secid": secid,
+        "fields": "f9,f23,f116",
+        # f9=PE(TTM动态) f23=PB f116=总市值
+    }
+    headers = {"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}
+    em_pe, em_pb, em_mcap_yi = None, None, None  # None = 不可用，区别于 0
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        d = r.json().get("data", {})
+        # 东财 PE/PB 字段放大了100倍，市值单位为元
+        raw_pe = d.get("f9")
+        raw_pb = d.get("f23")
+        raw_mcap = d.get("f116")
+        em_pe = float(raw_pe) / 100 if raw_pe else None
+        em_pb = float(raw_pb) / 100 if raw_pb else None
+        em_mcap_yi = float(raw_mcap) / 1e8 if raw_mcap else None
+    except Exception as e:
+        print(f"[WARN] 东财估值字段获取失败（盘后 push2delay 超时属正常）: {e}")
+
+    tc_pe = tencent.get("pe_ttm", 0)
+    tc_pb = tencent.get("pb", 0)
+    tc_mcap = tencent.get("mcap_yi", 0)
+
+    def diff_pct(a, b):
+        if a is None or b is None or not a or not b:
+            return None
+        return round(abs(a - b) / ((a + b) / 2) * 100, 2)
+
+    pe_diff = diff_pct(tc_pe, em_pe)
+    pb_diff = diff_pct(tc_pb, em_pb)
+    mcap_diff = diff_pct(tc_mcap, em_mcap_yi)
+
+    THRESHOLD = 5.0
+    warnings = []
+    em_available = em_pe is not None
+    if not em_available:
+        warnings.append("东财 push2 盘后不可用（push2delay 超时），仅腾讯数据有效")
+    else:
+        if pe_diff is not None and pe_diff > THRESHOLD:
+            warnings.append(f"PE(TTM) 双源差异 {pe_diff}%（腾讯{tc_pe} vs 东财{em_pe}）")
+        if pb_diff is not None and pb_diff > THRESHOLD:
+            warnings.append(f"PB 双源差异 {pb_diff}%（腾讯{tc_pb} vs 东财{em_pb}）")
+        if mcap_diff is not None and mcap_diff > THRESHOLD:
+            warnings.append(f"市值双源差异 {mcap_diff}%（腾讯{tc_mcap}亿 vs 东财{em_mcap_yi:.1f}亿）")
+
+    return {
+        "code": code,
+        "tencent":   {"pe_ttm": tc_pe, "pb": tc_pb, "mcap_yi": tc_mcap},
+        "eastmoney": {"pe_ttm": em_pe, "pb": em_pb, "mcap_yi": round(em_mcap_yi, 2) if em_mcap_yi else None},
+        "em_available": em_available,
+        "pe_diff_pct":   pe_diff,
+        "pb_diff_pct":   pb_diff,
+        "mcap_diff_pct": mcap_diff,
+        "warnings":  warnings,
+        "consistent": em_available and len(warnings) == 0,
+    }
+
+
+# ─────────────────────────────────────────
 # 行业分类口径映射工具
 # ─────────────────────────────────────────
 
@@ -829,5 +1016,19 @@ if __name__ == "__main__":
         print(f"  ❌ 阻断原因: {result['block_reasons']}")
     if result["caution_reasons"]:
         print(f"  ⚠️  注意原因: {result['caution_reasons']}")
+
+    # 7. PE/PB 双源交叉校验
+    print(f"\n[7] PE/PB 双源交叉校验 — {TEST_CODE}")
+    try:
+        cv = cross_validate_valuation(TEST_CODE)
+        print(f"  腾讯: PE={cv['tencent']['pe_ttm']} PB={cv['tencent']['pb']} 市值={cv['tencent']['mcap_yi']}亿")
+        print(f"  东财: PE={cv['eastmoney']['pe_ttm']} PB={cv['eastmoney']['pb']} 市值={cv['eastmoney']['mcap_yi']}亿")
+        if cv["consistent"]:
+            print("  ✅ 双源一致")
+        else:
+            for w in cv["warnings"]:
+                print(f"  ⚠️  {w}")
+    except Exception as e:
+        print(f"  ❌ 失败: {e}")
 
     print("\n✅ 验证完成")
