@@ -57,13 +57,21 @@ A股短线尾盘选股系统，基于四层过滤机制，每日 **14:45–14:55
 
 ## 数据需求
 
-所有数据通过 **thsdk**（主）+ **tavily_extract 爬取东方财富**（补充）获取，无需额外 API Key。
+> 最后更新：2026-05-21（数据链路补强）
+
+**数据源现状：**
+- **东财 push2 HTTP（当前主链路，无需鉴权）** — 替代不可用的 thsdk
+- **thsdk（需重新鉴权，当前不可用）** — 原主数据源，待重新鉴权后恢复兜底
+- **cls.cn 直连（主）** — 财联社快讯，替代 Tavily 爬取
+- **Tavily（兜底）** — 仅在直连失败时使用
 
 详细接入代码见 [references/data-sources.md](references/data-sources.md)。
 
-| 层 | 数据类型 | 主数据源 |
-|---|---|---|
-| 第一层 | 指数MA20、涨跌停数、北向资金、情绪周期 | thsdk `klines()` + eastmoney/cls.cn |
-| 第二层 | 板块涨幅排行、板块涨停数 | thsdk `ths_industry()` + `block_constituents()` |
-| 第三层 | 个股K线、量比、换手率、分时、流通市值 | thsdk `klines()` + `market_data_cn()` + `intraday_data()` |
-| 第四层 | 大单净流入、龙虎榜 | thsdk `big_order_flow()` + eastmoney lhb |
+| 层 | 数据类型 | 主数据源（当前）| 原始数据源（需鉴权）|
+|---|---|---|---|
+| 第一层 | 指数MA20、涨跌停数、北向资金、情绪周期 | 东财push2 HTTP + cls.cn | thsdk `klines()` |
+| 第二层 | 板块涨幅排行、板块涨停数 | 东财 push2 行业板块 | thsdk `ths_industry()` |
+| 第三层 | 个股K线、量比、换手率、分时、流通市值 | 腾讯财经 + mootdx TCP | thsdk `klines()` + `market_data_cn()` |
+| 第四层 | 大单净流入 | **东财push2 `fflow/kline`（主）** | thsdk `big_order_flow()`（兜底，口径略有差异） |
+| 第四层 | 龙虎榜 | 东财 datacenter-web `RPT_DAILYBILLBOARD` 🆕 | — |
+| 新闻层 | 财联社快讯 | **cls.cn 直连 HTTP（主）** | Tavily（兜底）|

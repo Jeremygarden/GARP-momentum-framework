@@ -1,20 +1,47 @@
 # 数据接入指南（隔夜套利专用）
 
-本策略所需数据全部为 **A股实时/日内数据**，以 thsdk 为主要接入方式，tavily_extract 爬取东方财富作为补充和验证。
+> 最后更新：2026-05-21（数据链路补强后现状）
+
+本策略所需数据全部为 **A股实时/日内数据**。
+
+**数据源现状：**
+- **东财 push2 HTTP（主链路，当前可用）** — 个股资金流/指数行情/快讯
+- **thsdk（需重新鉴权，当前不可用）** — 原主数据源，`big_order_flow()` 返回"未登录"
+- **cls.cn 直连 HTTP（主，替代 Tavily）** — 财联社分钟级快讯
+- **Tavily（兜底）** — 东方财富/财联社，仅在直连失败时使用
 
 ---
 
 ## 数据源配置
 
 ```python
-# 主数据源：同花顺 SDK（实时行情、板块、大单）
-# 认证通过环境变量（THS_USERNAME / THS_PASSWORD）或游客模式
-from thsdk import THS
-ths = THS()
-ths.connect()
+# 主数据源1：东财 push2 直连 HTTP（当前可用，无需鉴权）
+import requests
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
-# 补充数据源：tavily_extract 爬取东方财富/财联社
-# 无需配置，OpenClaw 内置
+# 个股资金流（分钟级）
+def get_fund_flow(code):
+    secid = f"1.{code}" if code.startswith(("6","9")) else f"0.{code}"
+    url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+    params = {"secid": secid, "klt": 1,
+              "fields1": "f1,f2,f3,f7", "fields2": "f51,f52,f53,f54,f55,f56,f57"}
+    r = requests.get(url, params=params,
+                     headers={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"},
+                     timeout=10)
+    return r.json().get("data", {}).get("klines", [])
+
+# 主数据源2：thsdk（需重新鉴权才可用，配置后可作为兜底）
+# ⚠️ 当前状态：未鉴权，big_order_flow() 返回"未登录"
+# from thsdk import THS
+# ths = THS()
+# ths.connect()  # 需 THS_USERNAME / THS_PASSWORD 环境变量
+
+# 财联社快讯（直连 cls.cn，主）
+def get_cls_news(n=50):
+    url = "https://www.cls.cn/nodeapi/telegraphList"
+    r = requests.get(url, params={"rn": str(n), "page": "1"},
+                     headers={"User-Agent": UA, "Referer": "https://www.cls.cn/"}, timeout=10)
+    return r.json().get("data", {}).get("roll_data", [])
 ```
 
 ---

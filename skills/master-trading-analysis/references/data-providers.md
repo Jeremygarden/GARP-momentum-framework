@@ -1,5 +1,8 @@
 # 数据源接入指南
 
+> 最后更新：2026-05-21（数据链路补强，L1-L7 七层架构）
+> 权威总览见 → `docs/data-pipeline-overview.md`
+
 本框架通过两个全局变量切换数据源，分析逻辑与数据获取完全解耦。
 
 ---
@@ -10,39 +13,102 @@
 
 | 数据源 | 价格复权行为 | 正确参数 | 说明 |
 |--------|:---:|---------|------|
-| **baostock** | 需手动指定 | `adjustflag="2"` | 1=后复权, **2=前复权** ✅, 3=不复权 |
-| **thsdk** | 需手动指定 | `adjust="前复权"` | 空字符串=不复权 |
-| **yfinance** | 默认自动除权 | `auto_adjust=True`（默认）| 默认即前复权逻辑 ✅ |
+| **baostock** | 需手动指定 | `adjustflag="2"` | 1=后复权, **2=前复权** ✅, 3=不复权。🔒 **冻结，禁止迁移** |
+| **mootdx** | **不支持前复权** | 仅用于实时行情/盘口/季报快照 | ⚠️ 禁止用于动量因子历史K线计算 |
+| **thsdk** | 需手动指定 | `adjust="前复权"` | ⚠️ **当前不可用（未鉴权）**，需重新鉴权才能作兜底 |
+| **yfinance** | 默认自动除权 | `auto_adjust=True`（默认）| 默认即前复权逻辑 ✅（港股/美股）|
 | **MX-Data (东财)** | 实时价/基本面指标 | 不涉及历史复权 | `NEWEST_PRICE`=实时成交价；PE/PB等估值已基于前复权价计算 ✅ |
 | **MX-StockPick** | 实时价 | 不涉及历史复权 | 涨跌幅、市值等均基于实时数据，无需复权 ✅ |
 | **Tavily/研报** | 文本数据 | N/A | 不返回价格序列，不涉及复权 |
 
 **结论：**
-- baostock 必须显式传 `adjustflag="2"`，否则默认 `"3"（不复权）`，会导致动量计算严重失真
-- thsdk 必须显式传 `adjust="前复权"`，否则默认不复权
-- yfinance 默认安全，无需额外操作
+- baostock 必须显式传 `adjustflag="2"`，否则默认 `"3"（不复权）`，会导致动量计算严重失真。**🔒 冻结，mootdx 不支持前复权，禁止迁移**
+- thsdk 当前未鉴权，返回"未登录"，`big_order_flow()` 和历史K线均不可用
+- yfinance 默认安全，无需额外操作（港股/美股）
 - MX 系列工具返回实时/基本面数据，无历史复权问题
 
 ---
 
 ## 数据链路优先级（GARP 五因子）
 
-> **2026-03-31 更新**：MX-Skill（东方财富妙想）提升为更准确、更稳定的优先级，重组如下：
+> **2026-05-21 更新**：全量补强为 L1-L7 七层架构，新增东财直连各端点、cls.cn 快讯、巨潮公告等。
 
 | 优先级 | 数据源 | 覆盖数据类型 | 适用因子 |
 |:---:|--------|------------|---------|
-| **L1** | **MX-StockPick** | 市值、PE、PB、涨跌幅、行业分类 | V估值基础数据、G筛选 |
-| **L2** | **MX-Data** | ROE、EPS、净利润、营收、现金流、估值历史 | G/Q/V 核心财务 |
-| **L3** | **MX-FinSearch** | 最新券商研报（11家重点）、分析师观点/评级 | 一致预期、盈利修正M |
-| **L4** | baostock / thsdk | A股历史价格（**前复权**）、量价、基本面 | M动量价格计算 |
-| **L5** | yfinance | 港股/美股历史价格（自动前复权）| 港股标的 M动量 |
-| **L6** | Tavily L3/L4 | 网搜研报补充、宏观数据 | 数据缺口兜底 |
-| **L7** | 中性填补 | 行业均值估算 | 最后兜底，必须标注⚠️ |
+| **L1** | **腾讯财经 qt.gtimg.cn + mootdx TCP 7709** | PE/PB/市值/换手率/量比/实时报价/盘口/K线 | V估值基础数据、G筛选 |
+| **L2** | **MX-Data / MX-FinSearch + 东财reportapi** | ROE/EPS/净利润/营收/现金流/研报列表/三年EPS | G/Q/V核心财务、一致预期 |
+| **L3** | **MX-StockPick + 东财push2 + auto_garp_score()** | AI选股评分/个股资金流分钟级/龙虎榜/解禁日历 | M动量、信号层 |
+| **L4** | **baostock（🔒冻结）** | A股历史价格（**前复权 adjustflag=2**） | M动量价格计算，禁止迁移 |
+| **L5** | **yfinance** | 港股/美股历史价格（自动前复权）| 港股标的 M动量 |
+| **L6** | **cls.cn + 东财search-api-web + Tavily** | 财联社快讯/个股新闻/宏观趋势数据 | 新闻情绪、宏观兜底 |
+| **L7** | **巨潮 cninfo.com.cn + 中性填补** | 沪深北全量公告/最后兜底 | 公告层、数据缺口 |
 
-**MX-Skill 三工具职责划分：**
-- `MX-StockPick`：按条件筛选个股基础行情数据（市值/PE/PB/涨跌幅等），GARP 初筛入口
-- `MX-Data`：深度财务数据（ROE/净利润/现金流等），替代 Tavily 抓东财数据
-- `MX-FinSearch`：批量抓取11家重点公司最新研报，获取分析师观点和评级，支撑盈利修正动量
+### 冻结项说明（禁止迁移）
+
+| 项目 | 原因 |
+|------|------|
+| baostock `adjustflag=2` 前复权K线 | mootdx实测不支持前复权；GARP动量因子M依赖 |
+| baostock `query_profit/growth/balance_data` | 新浪三表已失效；GARP成长因子G依赖多期YOY增速 |
+
+### 废弃项
+
+| 项目 | 状态 |
+|------|------|
+| **新浪财经三表** | ❌ 废弃（接口返回 `__ERROR:3 Service not valid`）→ 由 baostock 承担 |
+| **财联社 Tavily 爬取** | ❌ 废弃 → 已被 cls.cn 直连替代 |
+
+### thsdk 当前状态
+
+> ⚠️ thsdk 当前未鉴权（返回"未登录"），`big_order_flow()` 和历史K线均不可用。
+> 东财 push2 为资金流主链路；A股历史K线由 baostock（🔒冻结）专属承担。
+> 如需重新启用 thsdk，需重新配置 `THS_USERNAME / THS_PASSWORD` 环境变量。
+
+---
+
+## 补强数据源（a_stock_supplement.py）
+
+> 2026-05-21 新增，位于 `scripts/a_stock_supplement.py`，直连东财各端点，无需 API Key。
+
+| 端点 | 用途 | 协议 |
+|------|------|------|
+| `push2.eastmoney.com` | 个股资金流分钟级（主力/大单/超大单）、行业涨跌排名、行业/总股本 | HTTP GET |
+| `push2his.eastmoney.com` | 个股资金流120日历史 | HTTP GET |
+| `datacenter-web.eastmoney.com` | 融资融券/大宗交易/股东户数/分红送转/龙虎榜/解禁日历 | HTTP GET |
+| `reportapi.eastmoney.com` | 研报列表+评级+三年EPS | HTTP GET |
+| `pdf.dfcfw.com` | 研报PDF（需Referer: eastmoney.com）| HTTP GET |
+| `cls.cn` | 财联社分钟级快讯（直连，替代Tavily爬取）| HTTP GET |
+| `cninfo.com.cn` | 沪深北全量公告直连（stock=600519,gssh0600519 格式）| HTTP GET |
+| `basic.10jqka.com.cn` | 同花顺机构一致预期EPS | HTTP GET |
+
+**龙虎榜直连示例：**
+```python
+import requests
+
+# 龙虎榜席位+机构动向（个股）
+url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+params = {
+    "reportName": "RPT_DAILYBILLBOARD_DETAILSNEW",
+    "columns": "ALL",
+    "filter": f'(SECURITY_CODE="{stock_code}")',
+    "pageSize": 50
+}
+resp = requests.get(url, params=params, headers={"Referer": "https://data.eastmoney.com/"})
+
+# 限售解禁日历（未来90天）
+params["reportName"] = "RPT_LIFT_STAGE"
+params["filter"] = f'(SECURITY_CODE="{stock_code}")'
+```
+
+**财联社快讯直连示例：**
+```python
+import requests
+
+# 财联社分钟级快讯
+resp = requests.get(
+    "https://www.cls.cn/nodeapi/updateTelegraphList",
+    headers={"Referer": "https://www.cls.cn/", "User-Agent": "Mozilla/5.0"}
+)
+```
 
 ---
 
@@ -219,7 +285,10 @@ DATA_API_KEY  = ""    # 不需要
 
 ---
 
-## 方式三：thsdk（同花顺 SDK）
+## 方式三：thsdk（同花顺 SDK）⚠️ 当前不可用，需重新鉴权
+
+> **2026-05-21 状态**：thsdk 当前未鉴权（返回"未登录"），`big_order_flow()` 不可用。
+> 东财 push2 HTTP 为资金流主链路。需重新配置 `THS_USERNAME / THS_PASSWORD` 才能作兜底使用。
 
 ### 适用场景
 - A股/港股/美股/期货/外汇 全市场
@@ -530,12 +599,14 @@ tavily_search(
 | 美股无 key 快速分析 | `tavily_extract` → `stockanalysis.com` / `finviz.com` |
 | 美股期权/波动率 | `tavily_extract` → `marketchameleon.com` |
 | 美股 ETF 研究 | `tavily_extract` → `etfdb.com` |
-| A股基本面分析 | `baostock`（免费、财务季报完整）|
-| A股实时行情+大单 | `thsdk`（Level2实时）|
-| A股综合（基本面+行情） | `baostock`（财务）+ `thsdk`（行情）|
-| A股资讯/舆情 | `tavily_search` → `eastmoney.com` + `cls.cn` + `xueqiu.com` |
-| A股官方公告 | `tavily_extract` → `cninfo.com.cn` |
+| A股基本面分析 | `baostock`（🔒冻结，免费、财务季报完整）|
+| **A股实时行情+大单** | **东财 push2 HTTP（当前主链路）**；thsdk 待鉴权后可作兜底 |
+| **A股综合（基本面+行情）** | **baostock（财务/历史K线）+ 腾讯财经/mootdx（实时行情）+ 东财push2（资金流）** |
+| A股资金流（分钟级） | 东财 push2 HTTP（主）/ thsdk big_order_flow()（需鉴权，兜底）|
+| **A股新闻/快讯** | **cls.cn 直连（主，替代Tavily）**；Tavily 降级为宏观兜底 |
+| A股官方公告 | `巨潮 cninfo.com.cn 直连`（🆕 主）/ `tavily_extract` |
 | A股历史估值 | `tavily_extract` → `eniu.com` / `macrotrends.net` |
+| 龙虎榜/解禁日历 | 东财 datacenter-web 直连（🆕 主）|
 
 ---
 
