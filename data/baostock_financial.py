@@ -8,12 +8,22 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import baostock as bs
 import numpy as np
 import pandas as pd
+
+
+def is_trading_hours() -> bool:
+    """判断当前是否在 A 股交易时间内（北京时间 9:15-15:35，工作日）。"""
+    CST = timezone(timedelta(hours=8))
+    now = datetime.now(CST)
+    if now.weekday() >= 5:
+        return False
+    t = now.hour * 100 + now.minute
+    return 915 <= t <= 1535
 
 
 def _to_bs_code(code: str) -> str:
@@ -36,10 +46,15 @@ def get_financial_data(code: str) -> dict:
     """
     从 baostock 拉取财务数据，计算 GARP 五因子所需字段。
     code: 6位代码，如 '600309'
-    """
-    bs_code = _to_bs_code(code)
 
-    # 登录 baostock（每次调用自动登录/登出，或在外部管理连接）
+    ⚠️ 盘后自动跳过：baostock TCP 在盘后（Azure 环境）连接超时。
+    盘后调用返回空字典，不阻塞。请在盘中（北京时间 9:15-15:35）运行。
+    """
+    if not is_trading_hours():
+        print(f"  [baostock] 盘后静默，跳过 {code}（请在盘中运行）")
+        return {"code": code, "source": "baostock", "skipped": True, "reason": "afterhours"}
+
+    bs_code = _to_bs_code(code)
     lg = bs.login()
 
     try:
@@ -271,9 +286,18 @@ def run_phase2_batch(
     2. 批量拉 baostock 财务数据（ROE/增速/动量）
     3. 调用 batch_garp_score 评分
     4. 输出 Top N 排名到 JSON 文件
+
+    ⚠️ 需要在盘中（北京时间 9:15-15:35）运行，baostock TCP 盘后不可用。
     """
-    from data.pre_filter import load_candidate_pool
-    from data.a_stock_supplement import batch_garp_score
+    if not is_trading_hours():
+        print("❌ 当前为盘后时间，baostock TCP 不可用，请在盘中运行。")
+        print("   建议运行时间：工作日 09:30-15:00（北京时间）")
+        return []
+
+    import sys, os
+    sys.path.insert(0, os.path.dirname(__file__))
+    from pre_filter import load_candidate_pool
+    from a_stock_supplement import batch_garp_score
 
     candidates = load_candidate_pool(candidate_pool_path)
     codes = [c["code"] for c in candidates]
@@ -303,19 +327,33 @@ def run_phase2_batch(
 
 
 if __name__ == "__main__":
-    from data.a_stock_supplement import auto_garp_score
+    import sys, os
+    sys.path.insert(0, os.path.dirname(__file__))
+    from a_stock_supplement import auto_garp_score
 
-    # 测试单只财务数据拉取
-    data = get_financial_data("600519")
-    print(f"茅台: ROE={data['roe']} 毛利率={data['gross_margin']} 负债率={data['debt_ratio']}")
-    print(f"  EPS CAGR={data['eps_cagr_3y']} 营收CAGR={data['revenue_cagr_3y']}")
-    print(f"  6M动量={data['momentum_6m_pct']}% 1M动量={data['momentum_1m_pct']}%")
+    for test_code, test_name in [("600519", "贵州茅台"), ("600309", "万华化学")]:
+        print(f"\n{'='*50}")
+        print(f"{test_name} {test_code}")
+        print('='*50)
 
-    # 测试全自动评分（财务数据自动填充）
-    result = auto_garp_score(
-        "600519",
-        regime="neutral",
-        **{k: data[k] for k in ["revenue_cagr_3y", "eps_cagr_3y", "roe", "gross_margin", "debt_ratio", "momentum_6m_pct"]},
-    )
-    print(f"\n茅台 GARP: 总分={result['total_score']} {result['tier']}")
-    print(f"  G={result['scores']['G']} Q={result['scores']['Q']} V={result['scores']['V']} M={result['scores']['M']} R={result['scores']['R']}")
+        data = get_financial_data(test_code)
+
+        if data.get("skipped"):
+            print(f"  ⚠️  {data.get('reason','盘后')} — 请在盘中（北京时间9:15-15:35）运行")
+            continue
+
+        print(f"ROE={data.get('roe')} 毛利率={data.get('gross_margin')} 负债率={data.get('debt_ratio')}")
+        print(f"EPS CAGR={data.get('eps_cagr_3y')} 营收CAGR={data.get('revenue_cagr_3y')}")
+        print(f"6M动量={data.get('momentum_6m_pct')}% 1M动量={data.get('momentum_1m_pct')}%")
+        print(f"ROE趋势={data.get('roe_trend')} 财报期={data.get('data_freshness')}")
+
+        fin_keys = ["revenue_cagr_3y","eps_cagr_3y","roe","gross_margin","debt_ratio","momentum_6m_pct"]
+        result = auto_garp_score(
+            test_code, regime="neutral",
+            **{k: data.get(k) for k in fin_keys}
+        )
+        print(f"\nGARP总分={result['total_score']} {result['tier']}")
+        print(f"G={result['scores']['G']} Q={result['scores']['Q']} V={result['scores']['V']} M={result['scores']['M']} R={result['scores']['R']}")
+        for k, v in result['factor_notes'].items():
+            print(f"  {k}: {v}")
+        print(f"建议: {result['recommendation']}")
