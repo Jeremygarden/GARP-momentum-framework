@@ -2,7 +2,16 @@
 a_stock_supplement.py
 =====================
 GARP 框架数据链路补强模块 — 基于 a-stock-data V3.1
-补强方向：
+
+🔒 Phase 2 冻结声明（2026-05-21 实测确认，禁止覆盖）：
+  - baostock adjustflag=2（前复权K线）：mootdx 不支持前复权，
+    GARP 动量因子依赖前复权价，baostock 不得迁移替换。
+  - baostock query_profit/growth/balance_data（财务增速）：
+    新浪三表接口已失效，字段标准化差，历史深度约20期不足，
+    GARP G增长因子依赖多期YOY增速，baostock 财务接口保留不动。
+  如需解除冻结，须提供完整替代方案验证报告。
+
+补强方向（并联，不替换现有妙想/MX-Skill）：
   1. 东财 push2 资金流（替代 Tavily 兜底，thsdk 作最终兜底）
   2. 龙虎榜席位（GARP Layer4 风险确认新维度）
   3. 限售解禁日历（风险层补充）
