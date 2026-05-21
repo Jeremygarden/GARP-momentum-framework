@@ -29,6 +29,43 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+# 行业标签缓存文件（盘中获取后保存，盘后直接读取）
+INDUSTRY_CACHE_PATH = os.path.join(os.path.dirname(__file__), "industry_cache.json")
+INDUSTRY_CACHE_MAX_AGE_HOURS = 24  # 缓存最长有效期（小时）
+
+
+def _load_industry_cache() -> dict[str, str]:
+    """读取行业缓存，超过 24h 视为过期。"""
+    if not os.path.exists(INDUSTRY_CACHE_PATH):
+        return {}
+    try:
+        with open(INDUSTRY_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        generated = datetime.fromisoformat(data.get("generated_at", "2000-01-01"))
+        age_hours = (datetime.now() - generated).total_seconds() / 3600
+        if age_hours > INDUSTRY_CACHE_MAX_AGE_HOURS:
+            print(f"  [行业缓存] 已过期（{age_hours:.1f}h），将重新获取")
+            return {}
+        cache = data.get("industries", {})
+        print(f"  [行业缓存] 命中 {len(cache)} 条（{age_hours:.1f}h 前生成）")
+        return cache
+    except Exception:
+        return {}
+
+
+def _save_industry_cache(industry_map: dict[str, str]):
+    """保存行业标签到缓存文件。"""
+    try:
+        with open(INDUSTRY_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump({
+                "generated_at": datetime.now().isoformat(),
+                "count": len(industry_map),
+                "industries": industry_map,
+            }, f, ensure_ascii=False, indent=2)
+        print(f"  [行业缓存] 已保存 {len(industry_map)} 条到 {INDUSTRY_CACHE_PATH}")
+    except Exception as e:
+        print(f"  [行业缓存] 保存失败: {e}")
+
 # ─────────────────────────────────────────
 # 全局配置
 # ─────────────────────────────────────────
@@ -269,12 +306,22 @@ def apply_dynamic_filter(
 
 def get_industry_batch(codes: list[str], max_workers: int = 20) -> dict[str, str]:
     """
-    批量获取行业代码（mootdx finance industry 字段，证监会行业代码）。
-    注意：mootdx finance 行业字段覆盖率约 1-5%，大量标的返回空。
-    无法获取行业的标的在 apply_sector_filter 中默认保留，不丢弃。
+    批量获取行业代码（mootdx finance industry 字段）。
+    优先读取盘中缓存，命中则直接返回，避免盘后重复请求。
+    缓存有效期 24h，每日盘中自动更新。
     """
     from mootdx.quotes import Quotes
 
+    # 读取缓存
+    cache = _load_industry_cache()
+    if cache:
+        # 用缓存补全当前 codes
+        results = {code: cache.get(code, "") for code in codes}
+        found = sum(1 for v in results.values() if v)
+        print(f"  [行业标签] 使用缓存，覆盖 {found}/{len(codes)} 只")
+        return results
+
+    # 缓存无效，实时获取
     results = {code: "" for code in codes}
     client = Quotes.factory(market="std")
 
@@ -299,7 +346,10 @@ def get_industry_batch(codes: list[str], max_workers: int = 20) -> dict[str, str
                 print(f"  [行业标签] {done}/{len(codes)}...")
 
     found = sum(1 for v in results.values() if v)
-    print(f"  [行业标签] 获取 {found}/{len(codes)} 只（覆盖率低属正常，无数据标的全部保留）")
+    print(f"  [行业标签] 实时获取 {found}/{len(codes)} 只（覆盖率低属正常，无数据标的全部保留）")
+
+    # 保存缓存（即使覆盖率低，下次盘中 push2 可用时再更新）
+    _save_industry_cache(results)
     return results
 
 

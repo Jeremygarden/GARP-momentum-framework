@@ -41,6 +41,20 @@ import pandas as pd
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 
+# ── 交易时间判断 ──
+def is_trading_hours() -> bool:
+    """
+    判断当前是否在 A 股交易时间内（北京时间）。
+    push2 在盘后重定向到 push2delay，Azure 超时，盘后自动跳过 push2 调用。
+    """
+    from datetime import datetime, timezone, timedelta
+    CST = timezone(timedelta(hours=8))
+    now = datetime.now(CST)
+    if now.weekday() >= 5:  # 周六/周日
+        return False
+    t = now.hour * 100 + now.minute
+    return 915 <= t <= 1535  # 9:15 - 15:35
+
 # 东财行业分类 → 申万一级行业 口径映射表（补充完善）
 # 行业分类漂移警告：未映射的行业需人工校验后添加
 INDUSTRY_MAP = {
@@ -148,13 +162,10 @@ def eastmoney_datacenter(
 def get_fund_flow_minute(code: str, fallback_thsdk: bool = True) -> list[dict]:
     """
     个股分钟级资金流向（当日盘中）。
-    主力: 东财 push2（实时）
-    兜底: thsdk（fallback_thsdk=True 时启用，需 thsdk 已安装）
-
-    返回字段（统一单位：万元）:
-      time, main_net_wan, large_net_wan, mid_net_wan,
-      small_net_wan, super_net_wan
+    盘后自动跳过（push2 盘后重定向 push2delay，Azure 超时属正常架构行为）。
     """
+    if not is_trading_hours():
+        return []  # 盘后静默，不发请求
     secid = get_secid(code)
     url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
     params = {
@@ -953,198 +964,6 @@ def _score_r(lockup_risk: str,
     return round(score, 1), veto, " | ".join(notes) if notes else "风险健康"
 
 
-def auto_garp_score(
-    code: str,
-    regime: str = "neutral",
-    # G因子输入
-    revenue_cagr_3y: Optional[float] = None,
-    eps_cagr_3y: Optional[float] = None,
-    consensus_eps_growth: Optional[float] = None,
-    # Q因子输入
-    roe: Optional[float] = None,
-    gross_margin: Optional[float] = None,
-    debt_ratio: Optional[float] = None,
-    # M因子输入
-    momentum_6m_pct: Optional[float] = None,
-    report_rating_trend: Optional[str] = None,  # 'upgrade'/'downgrade'/'stable'
-    # MX-StockPick 输入（可选，并联）
-    mx_signal: Optional[str] = None,   # 'strong_buy'/'buy'/'hold'/'sell'
-    mx_score: Optional[float] = None,
-) -> dict:
-    """
-    GARP 五因子 AI 自动评分（轻量版）。
-
-    自动从已有数据源获取：PE/PB（腾讯财经）、资金流（东财push2）、
-    龙虎榜（东财datacenter）、限售解禁（东财datacenter）、财联社（cls.cn）
-
-    手动传入：成长/质量/动量的财务字段（从 baostock 或 MX-Data 获取）
-
-    regime: 当前市场状态
-      'deep_bear'/'bear'/'neutral'(默认)/'bull'/'bubble'
-
-    返回: {
-        code, regime, scores: {G,Q,V,M,R},
-        weights, total_score, tier,
-        veto, veto_reason,
-        notes, mx_cross_check,
-        recommendation
-    }
-    """
-    trade_date = datetime.now().strftime("%Y-%m-%d")
-    weights = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS["neutral"])
-
-    # ── 自动获取行情数据 ──
-    tc_data = {}
-    try:
-        tc = tencent_quote([normalize_code(code)])
-        tc_data = tc.get(normalize_code(code), {})
-    except Exception as e:
-        print(f"[WARN] 腾讯财经行情获取失败: {e}")
-
-    pe_ttm = tc_data.get("pe_ttm") or None
-    pb = tc_data.get("pb") or None
-
-    # ── 自动获取信号层数据 ──
-    fund_flow_signal = "neutral"
-    try:
-        ff = get_fund_flow_summary(code)
-        fund_flow_signal = ff.get("signal", "neutral")
-    except Exception:
-        pass
-
-    lockup_risk = "none"
-    try:
-        lk = get_lockup_expiry(code, trade_date)
-        lockup_risk = lk.get("risk_label", "none")
-    except Exception:
-        pass
-
-    dragon_tiger_signal = "pass"
-    try:
-        dt = get_dragon_tiger(code, trade_date)
-        dragon_tiger_signal = dt.get("layer4_signal", "pass")
-    except Exception:
-        pass
-
-    cls_alerts = []
-    try:
-        cls_news = get_cls_telegraph(50)
-        cls_alerts = cls_keyword_alert(
-            filter_cls_by_holdings(cls_news, [normalize_code(code)])
-        )
-    except Exception:
-        pass
-
-    # ── 研报评级趋势（自动从东财研报分析）──
-    if report_rating_trend is None:
-        try:
-            reports = get_eastmoney_reports(code, max_pages=1)
-            if len(reports) >= 2:
-                recent_ratings = [r["rating"] for r in reports[:5] if r.get("rating")]
-                buy_count = sum(1 for r in recent_ratings if "买入" in r or "增持" in r)
-                sell_count = sum(1 for r in recent_ratings if "减持" in r or "卖出" in r)
-                if buy_count >= 3:
-                    report_rating_trend = "upgrade"
-                elif sell_count >= 2:
-                    report_rating_trend = "downgrade"
-                else:
-                    report_rating_trend = "stable"
-        except Exception:
-            report_rating_trend = "stable"
-
-    # ── G_adjusted 用于 V 因子 PEG 计算 ──
-    g_candidates = []
-    if revenue_cagr_3y: g_candidates.append(revenue_cagr_3y * 0.70)
-    if eps_cagr_3y:     g_candidates.append(eps_cagr_3y * 0.70)
-    if consensus_eps_growth: g_candidates.append(consensus_eps_growth * 0.80)
-    g_adjusted_pct = min(g_candidates) if g_candidates else None
-
-    # ── 五因子打分 ──
-    g_score, g_note = _score_g(revenue_cagr_3y, eps_cagr_3y, consensus_eps_growth)
-    q_score, q_note = _score_q(roe, gross_margin, debt_ratio)
-    v_score, v_note = _score_v(pe_ttm, pb, g_adjusted_pct, regime)
-    m_score, m_note = _score_m(momentum_6m_pct, fund_flow_signal, report_rating_trend)
-    r_score, veto, r_note = _score_r(lockup_risk, dragon_tiger_signal, cls_alerts)
-
-    # ── 加权总分 ──
-    if veto:
-        total = 0.0
-        tier = "❌ 一票否决"
-    else:
-        total = round(
-            g_score * weights["G"] +
-            q_score * weights["Q"] +
-            v_score * weights["V"] +
-            m_score * weights["M"] +
-            r_score * weights["R"], 1
-        )
-        if total >= 85:   tier = "💎 钻石"
-        elif total >= 75: tier = "🥇 黄金"
-        elif total >= 60: tier = "🥈 白银"
-        else:             tier = "🗑️ 剔除"
-
-    # ── MX-StockPick 并联交叉验证 ──
-    mx_cross = {"available": False, "consistent": None, "note": "MX信号未传入"}
-    if mx_signal and mx_score is not None:
-        mx_cross["available"] = True
-        mx_bullish = mx_signal in ("strong_buy", "buy")
-        garp_bullish = total >= 70
-        mx_cross["consistent"] = mx_bullish == garp_bullish
-        if mx_cross["consistent"]:
-            mx_cross["note"] = f"✅ MX({mx_signal}/{mx_score:.0f}分) 与 GARP({total}分) 方向一致"
-            if mx_bullish and garp_bullish:
-                total = min(100, total + 3)  # 双信号确认小幅加分
-        else:
-            mx_cross["note"] = f"⚠️ MX({mx_signal}/{mx_score:.0f}分) 与 GARP({total}分) 方向背离，需人工复核"
-
-    # ── R < 90 强制风险披露 ──
-    risk_disclosure = None
-    if r_score < 90 and not veto:
-        level = "高风险" if r_score < 60 else ("中风险" if r_score < 80 else "中低风险")
-        risk_disclosure = {
-            "level": f"⚠️ {level}（R={r_score}）",
-            "note": r_note,
-            "action": "下次复核重点关注龙虎榜机构动向、限售解禁进度、快讯风险告警",
-        }
-
-    # ── 建议 ──
-    if veto:
-        recommendation = "❌ 一票否决 — 立即复核，暂停建仓"
-    elif total >= 85:
-        recommendation = "强烈建议持有/加仓，各因子全面优秀"
-    elif total >= 75:
-        recommendation = "建议持有，可适量加仓，注意估值上限"
-    elif total >= 60:
-        recommendation = "观察仓，不加仓，等待因子改善"
-    else:
-        recommendation = "建议减仓或剔除"
-
-    return {
-        "code": code,
-        "name": tc_data.get("name", ""),
-        "regime": regime,
-        "scores": {"G": g_score, "Q": q_score, "V": v_score, "M": m_score, "R": r_score},
-        "weights": {k: f"{v*100:.0f}%" for k, v in weights.items()},
-        "factor_notes": {"G": g_note, "Q": q_note, "V": v_note, "M": m_note, "R": r_note},
-        "total_score": total,
-        "tier": tier,
-        "veto": veto,
-        "mx_cross_check": mx_cross,
-        "risk_disclosure": risk_disclosure,
-        "recommendation": recommendation,
-        "data_snapshot": {
-            "pe_ttm": pe_ttm, "pb": pb,
-            "fund_flow": fund_flow_signal,
-            "lockup_risk": lockup_risk,
-            "dragon_tiger": dragon_tiger_signal,
-            "report_trend": report_rating_trend,
-        },
-    }
-
-
-# ─────────────────────────────────────────
-# 腾讯财经实时行情（PE/PB/估值层）
-# ─────────────────────────────────────────
 
 def tencent_quote(codes: list[str]) -> dict[str, dict]:
     """
@@ -1214,9 +1033,10 @@ def tencent_quote(codes: list[str]) -> dict[str, dict]:
 
 def eastmoney_stock_info(code: str) -> dict:
     """
-    东财 push2 个股基础信息（资金流层补充）。
-    覆盖：行业/总股本/流通股/总市值/上市日期
+    东财 push2 个股基础信息。盘后静默（push2 盘后不可用）。
     """
+    if not is_trading_hours():
+        return {}  # 盘后静默
     secid = get_secid(code)
     url = "https://push2.eastmoney.com/api/qt/stock/get"
     params = {
@@ -1277,18 +1097,19 @@ def cross_validate_valuation(code: str) -> dict:
     }
     headers = {"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}
     em_pe, em_pb, em_mcap_yi = None, None, None  # None = 不可用，区别于 0
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        d = r.json().get("data", {})
-        # 东财 PE/PB 字段放大了100倍，市值单位为元
-        raw_pe = d.get("f9")
-        raw_pb = d.get("f23")
-        raw_mcap = d.get("f116")
-        em_pe = float(raw_pe) / 100 if raw_pe else None
-        em_pb = float(raw_pb) / 100 if raw_pb else None
-        em_mcap_yi = float(raw_mcap) / 1e8 if raw_mcap else None
-    except Exception as e:
-        print(f"[WARN] 东财估值字段获取失败（盘后 push2delay 超时属正常）: {e}")
+    if is_trading_hours():
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+            d = r.json().get("data", {})
+            raw_pe = d.get("f9")
+            raw_pb = d.get("f23")
+            raw_mcap = d.get("f116")
+            em_pe = float(raw_pe) / 100 if raw_pe else None
+            em_pb = float(raw_pb) / 100 if raw_pb else None
+            em_mcap_yi = float(raw_mcap) / 1e8 if raw_mcap else None
+        except Exception as e:
+            print(f"[WARN] 东财估值字段获取失败: {e}")
+    # 盘后静默：不发请求，em_* 保持 None，校验函数会标记 em_available=False
 
     tc_pe = tencent.get("pe_ttm", 0)
     tc_pb = tencent.get("pb", 0)
@@ -1346,8 +1167,423 @@ def map_industry(eastmoney_industry: str) -> str:
 
 
 # ─────────────────────────────────────────
-# 快速验证入口
+# 赛道质量评分（Phase 2 核心，嵌入 G/Q 因子）
 # ─────────────────────────────────────────
+
+# 赛道质量评分标准（与 execution-sop.md 步骤3 对齐）
+# 三维：市场集中度(CR3) + 供需结构 + 价格趋势
+# 分值：0-100，< 43 分触发 G 因子降级（不一票否决）
+
+def score_sector_quality(
+    cr3_pct: Optional[float] = None,          # 行业 CR3（前三名市占率%），越高越好
+    supply_demand: Optional[str] = None,       # 供需状态: 'tight'/'balanced'/'oversupply'
+    price_trend_12m: Optional[str] = None,     # 产品价格趋势: 'rising'/'stable'/'falling'
+    competitive_moat: Optional[str] = None,    # 护城河类型: 'tech'/'scale'/'brand'/'resource'/'weak'
+    cycle_position: Optional[str] = None,      # 大宗周期位置: 'early'/'mid'/'late'/'peak'/'none'
+    notes: str = "",
+) -> dict:
+    """
+    赛道质量评分（0-100）。
+
+    设计原则：
+    - 量化 + 定性结合，纯定性输入也能打分
+    - CR3 > 60% = 强护城河（集中度高，定价权强）
+    - 供需偏紧 = 正向信号（万华化学MDI就是典型）
+    - 大宗超级周期判断：cycle_position='early'/'mid' 是加分项
+    - 分数 < 43 → G 因子降级（成长总分削减，不直接否决标的）
+
+    示例（万华化学）：
+        score_sector_quality(
+            cr3_pct=90,                    # 全球MDI：万华+巴斯夫+科思创 CR3≈90%
+            supply_demand='tight',          # MDI供需偏紧
+            price_trend_12m='rising',       # MDI价格上行
+            competitive_moat='tech',        # 技术壁垒+规模壁垒
+            cycle_position='mid',           # 化工大宗上行周期中期
+        )
+    """
+    score = 50.0  # 基础分
+    detail = []
+
+    # 1. 市场集中度（CR3）
+    if cr3_pct is not None:
+        if cr3_pct >= 80:   score += 25; detail.append(f"CR3={cr3_pct}%极高垄断")
+        elif cr3_pct >= 60: score += 18; detail.append(f"CR3={cr3_pct}%高集中度")
+        elif cr3_pct >= 40: score += 8;  detail.append(f"CR3={cr3_pct}%中等集中")
+        elif cr3_pct >= 20: score += 0;  detail.append(f"CR3={cr3_pct}%分散")
+        else:               score -= 10; detail.append(f"CR3={cr3_pct}%高度分散")
+
+    # 2. 供需结构
+    if supply_demand:
+        mapping = {
+            "tight":       (20, "供需偏紧，价格有支撑"),
+            "balanced":    (5,  "供需平衡"),
+            "oversupply":  (-20, "产能过剩，价格承压"),
+        }
+        delta, note = mapping.get(supply_demand, (0, ""))
+        score += delta
+        if note:
+            detail.append(note)
+
+    # 3. 价格趋势（近12个月产品/服务价格）
+    if price_trend_12m:
+        mapping = {
+            "rising":   (15, "产品价格上行"),
+            "stable":   (5,  "价格平稳"),
+            "falling":  (-15, "产品价格下行"),
+        }
+        delta, note = mapping.get(price_trend_12m, (0, ""))
+        score += delta
+        if note:
+            detail.append(note)
+
+    # 4. 护城河类型
+    if competitive_moat:
+        mapping = {
+            "tech":     (15, "技术壁垒"),
+            "scale":    (12, "规模壁垒"),
+            "brand":    (12, "品牌壁垒"),
+            "resource": (10, "资源壁垒"),
+            "weak":     (-10, "护城河弱"),
+        }
+        delta, note = mapping.get(competitive_moat, (0, ""))
+        score += delta
+        if note:
+            detail.append(note)
+
+    # 5. 大宗周期位置（仅对周期性行业有意义）
+    if cycle_position and cycle_position != "none":
+        mapping = {
+            "early": (15, "大宗周期早期，上行空间大"),
+            "mid":   (8,  "大宗周期中期，趋势延续"),
+            "late":  (-5, "大宗周期后期，注意拐点"),
+            "peak":  (-20, "大宗周期顶部，下行风险"),
+        }
+        delta, note = mapping.get(cycle_position, (0, ""))
+        score += delta
+        if note:
+            detail.append(note)
+
+    score = round(max(0, min(100, score)), 1)
+    below_threshold = score < 43
+
+    return {
+        "score": score,
+        "below_threshold": below_threshold,
+        "grade": "优质赛道" if score >= 70 else ("良好赛道" if score >= 55 else ("一般赛道" if score >= 43 else "⚠️ 赛道质量不足(<43)")),
+        "detail": " | ".join(detail) if detail else "无输入，中性评分",
+        "notes": notes,
+        "g_factor_impact": "G因子降级（赛道质量<43）" if below_threshold else "正常",
+    }
+
+
+def _score_g_with_sector(
+    revenue_cagr_3y: Optional[float],
+    eps_cagr_3y: Optional[float],
+    consensus_eps_growth: Optional[float],
+    sector_quality: Optional[dict] = None,
+) -> tuple[float, str]:
+    """
+    G 因子评分（含赛道质量加权）。
+    赛道质量 < 43 → G_adjusted 打折 40%（成长不可持续风险）
+    赛道质量 >= 70 → G_adjusted 加成 10%（强赛道溢价）
+    """
+    candidates = []
+    if revenue_cagr_3y is not None:
+        candidates.append(revenue_cagr_3y * 0.70)
+    if eps_cagr_3y is not None:
+        candidates.append(eps_cagr_3y * 0.70)
+    if consensus_eps_growth is not None:
+        candidates.append(consensus_eps_growth * 0.80)
+
+    if not candidates:
+        base_note = "无增速数据，给中性分50"
+        g_adj = None
+    else:
+        g_adj = min(candidates)
+        if g_adj >= 30:   base_score, base_note = 95, f"G_adj={g_adj:.1f}% 高成长"
+        elif g_adj >= 20: base_score, base_note = 85, f"G_adj={g_adj:.1f}% 优质成长"
+        elif g_adj >= 15: base_score, base_note = 75, f"G_adj={g_adj:.1f}% 中高成长"
+        elif g_adj >= 10: base_score, base_note = 65, f"G_adj={g_adj:.1f}% 中等成长"
+        elif g_adj >= 5:  base_score, base_note = 50, f"G_adj={g_adj:.1f}% 低成长"
+        elif g_adj >= 0:  base_score, base_note = 35, f"G_adj={g_adj:.1f}% 微增长"
+        else:             base_score, base_note = 15, f"G_adj={g_adj:.1f}% 负增长"
+
+    if not candidates:
+        return 50.0, base_note
+
+    # 赛道质量修正
+    sector_note = ""
+    if sector_quality:
+        sq = sector_quality.get("score", 50)
+        if sq < 43:
+            base_score = round(base_score * 0.6, 1)  # 40% 折扣
+            sector_note = f" [赛道<43分降级→×0.6]"
+        elif sq >= 70:
+            base_score = min(100, round(base_score * 1.1, 1))  # 10% 加成
+            sector_note = f" [强赛道({sq}分)加成→×1.1]"
+        else:
+            sector_note = f" [赛道质量{sq}分]"
+
+    return float(base_score), base_note + sector_note
+
+
+# ─────────────────────────────────────────
+# Phase 2: 批量并发 GARP 评分
+# ─────────────────────────────────────────
+
+def batch_garp_score(
+    stocks: list[dict],
+    regime: str = "neutral",
+    max_workers: int = 10,
+    financial_data: Optional[dict] = None,
+) -> list[dict]:
+    """
+    批量并发 GARP 五因子评分 — Phase 2 核心入口。
+
+    stocks: 标的列表，格式为 pre_filter.load_candidate_pool() 返回值
+            每个元素至少包含 {code, name}
+            可选财务字段：revenue_cagr_3y, eps_cagr_3y, roe, gross_margin,
+                         debt_ratio, momentum_6m_pct, sector_quality
+
+    financial_data: {code: {revenue_cagr_3y, eps_cagr_3y, roe, ...}}
+                    来自 baostock 财务接口，可选，不传则相应因子给中性分
+
+    regime: 市场状态，'deep_bear'/'bear'/'neutral'/'bull'/'bubble'
+    max_workers: 并发线程数，建议 8-15，过高可能触发限流
+
+    返回: 按总分降序排列的评分列表
+    耗时估算: 400只 × 3个接口 / 10线程 ≈ 2-4 分钟
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    financial_data = financial_data or {}
+
+    def score_one(stock: dict) -> dict:
+        code = stock["code"]
+        fin = financial_data.get(code, {})
+        sq = fin.get("sector_quality")  # 可选的赛道质量评分 dict
+
+        try:
+            result = auto_garp_score(
+                code=code,
+                regime=regime,
+                revenue_cagr_3y=fin.get("revenue_cagr_3y"),
+                eps_cagr_3y=fin.get("eps_cagr_3y"),
+                consensus_eps_growth=fin.get("consensus_eps_growth"),
+                roe=fin.get("roe"),
+                gross_margin=fin.get("gross_margin"),
+                debt_ratio=fin.get("debt_ratio"),
+                momentum_6m_pct=fin.get("momentum_6m_pct"),
+                report_rating_trend=fin.get("report_rating_trend"),
+                mx_signal=fin.get("mx_signal"),
+                mx_score=fin.get("mx_score"),
+                sector_quality=sq,
+            )
+            return result
+        except Exception as e:
+            return {
+                "code": code,
+                "name": stock.get("name", ""),
+                "total_score": 0,
+                "tier": "❌ 评分失败",
+                "error": str(e),
+                "regime": regime,
+            }
+
+    results = []
+    done = 0
+    total = len(stocks)
+
+    print(f"[batch_garp_score] 开始评分 {total} 只，{max_workers} 线程，市场状态={regime}")
+    t0 = time.time()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(score_one, s): s for s in stocks}
+        for future in as_completed(futures):
+            results.append(future.result())
+            done += 1
+            if done % 50 == 0:
+                elapsed = time.time() - t0
+                eta = elapsed / done * (total - done)
+                print(f"  [{done}/{total}] 已完成，耗时{elapsed:.0f}s，预计剩余{eta:.0f}s")
+
+    # 按总分降序排列
+    results.sort(key=lambda x: x.get("total_score", 0), reverse=True)
+    elapsed = time.time() - t0
+    print(f"[batch_garp_score] 完成！耗时 {elapsed:.1f}s，有效结果 {len([r for r in results if r.get('total_score',0)>0])} 只")
+    return results
+
+
+def auto_garp_score(
+    code: str,
+    regime: str = "neutral",
+    revenue_cagr_3y: Optional[float] = None,
+    eps_cagr_3y: Optional[float] = None,
+    consensus_eps_growth: Optional[float] = None,
+    roe: Optional[float] = None,
+    gross_margin: Optional[float] = None,
+    debt_ratio: Optional[float] = None,
+    momentum_6m_pct: Optional[float] = None,
+    report_rating_trend: Optional[str] = None,
+    mx_signal: Optional[str] = None,
+    mx_score: Optional[float] = None,
+    sector_quality: Optional[dict] = None,
+) -> dict:
+    """
+    GARP 五因子 AI 自动评分（轻量版）。
+    自动获取：PE/PB（腾讯财经）、资金流（东财push2，盘中）、龙虎榜/解禁/财联社。
+    手动传入：财务字段（baostock 或 MX-Data）、赛道质量（score_sector_quality()）。
+    sector_quality: 传入则 G 因子根据赛道质量做加成/降级调整。
+    """
+    trade_date = datetime.now().strftime("%Y-%m-%d")
+    weights = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS["neutral"])
+
+    # 自动获取行情
+    tc_data = {}
+    try:
+        tc = tencent_quote([normalize_code(code)])
+        tc_data = tc.get(normalize_code(code), {})
+    except Exception as e:
+        print(f"[WARN] 腾讯财经行情获取失败: {e}")
+
+    pe_ttm = tc_data.get("pe_ttm") or None
+    pb = tc_data.get("pb") or None
+
+    # 自动获取信号层（盘中时有效，盘后静默）
+    fund_flow_signal = "neutral"
+    try:
+        ff = get_fund_flow_summary(code)
+        fund_flow_signal = ff.get("signal", "neutral")
+    except Exception:
+        pass
+
+    lockup_risk = "none"
+    try:
+        lk = get_lockup_expiry(code, trade_date)
+        lockup_risk = lk.get("risk_label", "none")
+    except Exception:
+        pass
+
+    dragon_tiger_signal = "pass"
+    try:
+        dt = get_dragon_tiger(code, trade_date)
+        dragon_tiger_signal = dt.get("layer4_signal", "pass")
+    except Exception:
+        pass
+
+    cls_alerts = []
+    try:
+        cls_news = get_cls_telegraph(50)
+        cls_alerts = cls_keyword_alert(
+            filter_cls_by_holdings(cls_news, [normalize_code(code)])
+        )
+    except Exception:
+        pass
+
+    # 研报评级趋势
+    if report_rating_trend is None:
+        try:
+            reports = get_eastmoney_reports(code, max_pages=1)
+            if len(reports) >= 2:
+                recent_ratings = [r["rating"] for r in reports[:5] if r.get("rating")]
+                buy_count = sum(1 for r in recent_ratings if "买入" in r or "增持" in r)
+                sell_count = sum(1 for r in recent_ratings if "减持" in r or "卖出" in r)
+                if buy_count >= 3:
+                    report_rating_trend = "upgrade"
+                elif sell_count >= 2:
+                    report_rating_trend = "downgrade"
+                else:
+                    report_rating_trend = "stable"
+        except Exception:
+            report_rating_trend = "stable"
+
+    # G_adjusted for V factor PEG
+    g_candidates = []
+    if revenue_cagr_3y: g_candidates.append(revenue_cagr_3y * 0.70)
+    if eps_cagr_3y:     g_candidates.append(eps_cagr_3y * 0.70)
+    if consensus_eps_growth: g_candidates.append(consensus_eps_growth * 0.80)
+    g_adjusted_pct = min(g_candidates) if g_candidates else None
+
+    # 五因子打分
+    g_score, g_note = _score_g_with_sector(revenue_cagr_3y, eps_cagr_3y, consensus_eps_growth, sector_quality)
+    q_score, q_note = _score_q(roe, gross_margin, debt_ratio)
+    v_score, v_note = _score_v(pe_ttm, pb, g_adjusted_pct, regime)
+    m_score, m_note = _score_m(momentum_6m_pct, fund_flow_signal, report_rating_trend)
+    r_score, veto, r_note = _score_r(lockup_risk, dragon_tiger_signal, cls_alerts)
+
+    # 加权总分
+    if veto:
+        total = 0.0
+        tier = "❌ 一票否决"
+    else:
+        total = round(
+            g_score * weights["G"] + q_score * weights["Q"] +
+            v_score * weights["V"] + m_score * weights["M"] +
+            r_score * weights["R"], 1
+        )
+        if total >= 85:   tier = "💎 钻石"
+        elif total >= 75: tier = "🥇 黄金"
+        elif total >= 60: tier = "🥈 白银"
+        else:             tier = "🗑️ 剔除"
+
+    # MX-StockPick 并联交叉验证
+    mx_cross = {"available": False, "consistent": None, "note": "MX信号未传入"}
+    if mx_signal and mx_score is not None:
+        mx_cross["available"] = True
+        mx_bullish = mx_signal in ("strong_buy", "buy")
+        garp_bullish = total >= 70
+        mx_cross["consistent"] = mx_bullish == garp_bullish
+        if mx_cross["consistent"]:
+            mx_cross["note"] = f"✅ MX({mx_signal}/{mx_score:.0f}分) 与 GARP({total}分) 方向一致"
+            if mx_bullish and garp_bullish:
+                total = min(100, total + 3)
+        else:
+            mx_cross["note"] = f"⚠️ MX({mx_signal}/{mx_score:.0f}分) 与 GARP({total}分) 方向背离，需人工复核"
+
+    # R < 90 强制风险披露
+    risk_disclosure = None
+    if r_score < 90 and not veto:
+        level = "高风险" if r_score < 60 else ("中风险" if r_score < 80 else "中低风险")
+        risk_disclosure = {
+            "level": f"⚠️ {level}（R={r_score}）",
+            "note": r_note,
+            "action": "下次复核重点关注龙虎榜机构动向、限售解禁进度、快讯风险告警",
+        }
+
+    # 建议
+    if veto:
+        recommendation = "❌ 一票否决 — 立即复核，暂停建仓"
+    elif total >= 85:
+        recommendation = "强烈建议持有/加仓，各因子全面优秀"
+    elif total >= 75:
+        recommendation = "建议持有，可适量加仓，注意估值上限"
+    elif total >= 60:
+        recommendation = "观察仓，不加仓，等待因子改善"
+    else:
+        recommendation = "建议减仓或剔除"
+
+    return {
+        "code": code,
+        "name": tc_data.get("name", ""),
+        "regime": regime,
+        "scores": {"G": g_score, "Q": q_score, "V": v_score, "M": m_score, "R": r_score},
+        "weights": {k: f"{v*100:.0f}%" for k, v in weights.items()},
+        "factor_notes": {"G": g_note, "Q": q_note, "V": v_note, "M": m_note, "R": r_note},
+        "total_score": total,
+        "tier": tier,
+        "veto": veto,
+        "mx_cross_check": mx_cross,
+        "risk_disclosure": risk_disclosure,
+        "recommendation": recommendation,
+        "data_snapshot": {
+            "pe_ttm": pe_ttm, "pb": pb,
+            "fund_flow": fund_flow_signal,
+            "lockup_risk": lockup_risk,
+            "dragon_tiger": dragon_tiger_signal,
+            "report_trend": report_rating_trend,
+        },
+        "sector_quality": sector_quality,
+    }
 
 if __name__ == "__main__":
     import json
