@@ -38,8 +38,46 @@ import pandas as pd
 # 全局配置
 # ─────────────────────────────────────────
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+
+# ── Cloudflare Worker 反代配置 ──────────────────────────────────────
+# Azure IP（AS8075）被东财 push2/push2his 服务端封锁，需通过 CF Worker 转发。
+# 部署 Worker 后，将 PUSH2_PROXY_BASE 设为 Worker URL，留空则直连（直连在 Azure 上不可用）。
+#
+# Worker 路由规则：
+#   /push2/*    → push2.eastmoney.com/*
+#   /push2his/* → push2his.eastmoney.com/*
+#
+# 例：PUSH2_PROXY_BASE = "https://em-proxy.your-name.workers.dev"
+#     原始: https://push2.eastmoney.com/api/qt/stock/fflow/kline/get
+#     代理: https://em-proxy.your-name.workers.dev/push2/api/qt/stock/fflow/kline/get
+#
+# Worker 代码见 deploy/cloudflare-worker/eastmoney-proxy.js
+import os as _os
+PUSH2_PROXY_BASE: str = _os.environ.get("PUSH2_PROXY_BASE", "").rstrip("/")
+
+
+def _push2_url(path: str) -> str:
+    """
+    构造 push2.eastmoney.com 的请求 URL。
+    有 PUSH2_PROXY_BASE 时走代理，否则直连（Azure 下直连不可用）。
+    path 示例："/api/qt/stock/fflow/kline/get"
+    """
+    if PUSH2_PROXY_BASE:
+        return f"{PUSH2_PROXY_BASE}/push2{path}"
+    return f"https://push2.eastmoney.com{path}"
+
+
+def _push2his_url(path: str) -> str:
+    """
+    构造 push2his.eastmoney.com 的请求 URL。
+    有 PUSH2_PROXY_BASE 时走代理，否则直连（Azure 下直连不可用）。
+    path 示例："/api/qt/stock/kline/get"
+    """
+    if PUSH2_PROXY_BASE:
+        return f"{PUSH2_PROXY_BASE}/push2his{path}"
+    return f"https://push2his.eastmoney.com{path}"
 
 # ── 交易时间判断 ──
 def is_trading_hours() -> bool:
@@ -167,7 +205,7 @@ def get_fund_flow_minute(code: str, fallback_thsdk: bool = True) -> list[dict]:
     if not is_trading_hours():
         return []  # 盘后静默，不发请求
     secid = get_secid(code)
-    url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+    url = _push2_url("/api/qt/stock/fflow/kline/get")
     params = {
         "secid": secid,
         "klt": 1,
@@ -1038,7 +1076,7 @@ def eastmoney_stock_info(code: str) -> dict:
     if not is_trading_hours():
         return {}  # 盘后静默
     secid = get_secid(code)
-    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    url = _push2_url("/api/qt/stock/get")
     params = {
         "secid": secid,
         "fields": "f57,f58,f84,f85,f116,f117,f127,f189",
@@ -1089,7 +1127,7 @@ def cross_validate_valuation(code: str) -> dict:
 
     # 东财 push2 估值字段
     secid = get_secid(code)
-    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    url = _push2_url("/api/qt/stock/get")
     params = {
         "secid": secid,
         "fields": "f9,f23,f116",
