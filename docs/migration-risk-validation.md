@@ -1,7 +1,7 @@
 # GARP 数据链路迁移风险验证报告（实测）
 
 > 实测环境：Azure / mootdx std / 2026-05-21 UTC
-> 最后决策更新：2026-05-21（已确认两条 baostock 保留决策）
+> 最后决策更新：2026-05-22（baostock TCP 9898 在 Azure 环境被封，两条冻结决策已迁移至替代方案）
 
 ---
 
@@ -12,10 +12,11 @@
 - `adjust='qfq'/'hfq'` 触发异常（`NDFrame.fillna()` 参数错误），`adjust='bfq'/'none'` 与默认一致
 结论: ❌（mootdx bars 在 std 市场下**不支持前复权**，相关参数无效）
 建议操作: 
-- **🔒 Phase 2 冻结决策：baostock 前复权K线不迁移**
-- GARP 动量因子（12M-1M 价格动量、相对强度）必须依赖前复权价
-- baostock `adjustflag=2` 是唯一已验证的前复权来源，**禁止在未完整验证替代方案前替换**
-- mootdx 仅用于原始价/盘口/逐笔，不用于动量因子计算
+- **🔒 baostock 前复权K线冻结决策已更新（2026-05-22）**
+- baostock TCP 9898 在 Azure 环境被服务端封锁（`login error_code=10002007`，SSL握手成功但协议层不通）
+- **当前替代方案：yfinance `auto_adjust=True`（前复权，HTTPS，Azure可用，已验证）**
+- baostock 代码在 `baostock_financial.py` 中完整保留（`DATA_SOURCE="baostock"` 开关切回）
+- **待办（2026-05-22）**：登录 Azure NSG 添加出站 TCP 9898 白名单 → 验证通过后重新评估是否切回
 
 ---
 
@@ -24,11 +25,13 @@
 - 请求利润表接口返回 `__ERROR:3, Service not valid`，JSONP 无法解析
 结论: ❌（当前接口不可用；且即使可用，历史深度约20期，字段标准化差，不满足 GARP 需求）
 建议操作: 
-- **🔒 Phase 2 冻结决策：新浪三表方案废弃，baostock 财务接口保留**
-- GARP 五因子的 G（增长因子）依赖多期历史增速，需要结构化字段
-- baostock 的 `query_profit_data` / `query_growth_data` / `query_balance_data` 提供现成 YOY 增速字段，历史深度充足
-- 新浪三表 HTML 爬取：字段标准化差、历史约20期（约5年季报）、接口当前失效，**三重原因废弃**
-- 财报数据链路：baostock 结构化接口 → 保留不迁移
+- **🔒 baostock 财务接口冻结决策已更新（2026-05-22）**
+- baostock TCP 9898 在 Azure 环境不可用（同上）
+- **当前替代方案：东财 `ZYZBAjaxNew`（HTTPS，Azure可用，已验证）**
+  - 覆盖字段：ROE（`ROEJQ`）、毛利率（`XSMLL`）、净利率（`XSJLL`）、负债率（`ZCFZL`）、营收/净利/EPS YOY 增速
+  - 历史深度：多年年报，≥5期，满足GARP需求
+- baostock 财务代码完整保留，`DATA_SOURCE="baostock"` 开关切回
+- **待办**：Azure NSG 开放 TCP 9898 后重新验证 baostock，评估是否切回（baostock字段标准化更稳定）
 
 ---
 
@@ -86,12 +89,14 @@
 
 ## 总体结论
 
-### 🔒 Phase 2 冻结项（禁止迁移，需明确解除冻结才能动）
+### 🔒 冻结项（已迁移替代方案，2026-05-22 更新）
 
-| 数据源 | 用途 | 冻结原因 |
-|--------|------|---------|
-| baostock `adjustflag=2` | GARP 动量因子前复权K线 | mootdx 不支持前复权，无替代方案 |
-| baostock `query_profit/growth/balance_data` | GARP G增长因子多期增速 | 新浪三表接口失效+深度不足+标准化差 |
+| 数据源 | 用途 | 状态 | 当前替代 |
+|--------|------|------|---------|
+| baostock `adjustflag=2` | GARP 动量因子前复权K线 | ⚠️ Azure TCP封锁 | yfinance `auto_adjust=True` ✅ |
+| baostock `query_profit/growth/balance_data` | GARP G增长因子多期增速 | ⚠️ Azure TCP封锁 | 东财 `ZYZBAjaxNew` ✅ |
+
+**切回条件**：Azure NSG 开放出站 TCP 9898 → `python3 data/baostock_financial.py` 验证通过 → 将 `DATA_SOURCE="baostock"`
 
 ### ✅ 可推进项
 - 东财研报 / 财联社 / 龙虎榜 / 解禁 / 资金流：直连 HTTP 稳定，已补强完成

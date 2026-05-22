@@ -13,7 +13,7 @@ L2 研报层       妙想 MX-FinSearch(AI解读) + 东财 reportapi(列表/PDF) 
 L3 信号层       妙想 MX-StockPick + auto_garp_score() + 东财push2(资金流) + 龙虎榜 + 解禁
 L4 资金面层     东财 datacenter(融资融券/大宗/股东户数/分红) + push2his(120日资金流)
 L5 新闻层       财联社 cls.cn(直连) + 东财新闻 + Tavily(宏观兜底)
-L6 基础数据层   妙想 MX-Data(深度财务) + baostock(历史K线🔒+财务增速🔒) + mootdx(37字段)
+L6 基础数据层   妙想 MX-Data(深度财务) + 东财ZYZBAjaxNew(财务增速) + yfinance(前复权K线) + mootdx(37字段) [baostock备用🔒]
 L7 公告层       巨潮 cninfo(直连) + mootdx F10
 ```
 
@@ -99,8 +99,9 @@ L7 公告层       巨潮 cninfo(直连) + mootdx F10
 | F10 公司资料（9大类）| mootdx F10 TCP | — |
 | 行业/总股本/流通股/上市日期 | 东财 push2 | — |
 | ~~财报三表~~ | ~~新浪财经~~ | ❌ **接口已失效，废弃** |
-| **A股历史K线（前复权）** | **baostock `adjustflag="2"`** | 🔒 **冻结，不可迁移** |
-| **A股财务增速（多期 YOY）** | **baostock `query_profit/growth/balance_data`** | 🔒 **冻结，不可迁移** |
+| **A股财务增速（ROE/毛利率/负债率/YOY）** | **东财 `ZYZBAjaxNew`**（HTTPS）| ✅ 当前主力（baostock TCP封锁后迁移 2026-05-22）|
+| **A股历史K线（前复权）** | **yfinance `auto_adjust=True`**（HTTPS）| ✅ 当前主力（baostock TCP封锁后迁移 2026-05-22）|
+| baostock 财务+K线（备用）| baostock TCP 9898 | ⚠️ Azure NSG封锁，代码保留，`DATA_SOURCE="baostock"` 可切回 |
 | 港股/美股历史K线 | yfinance `auto_adjust=True` | — |
 | 大盘情绪指标（全A PE/北向）| 东财全A估值 + Tavily | — |
 
@@ -115,14 +116,15 @@ L7 公告层       巨潮 cninfo(直连) + mootdx F10
 
 ---
 
-## 冻结项（🔒 禁止迁移）
+## 冻结项（🔒 已迁移替代方案，2026-05-22 更新）
 
-| 数据源 | 用途 | 冻结原因 |
-|--------|------|---------|
-| baostock `adjustflag=2` | GARP 动量因子前复权K线 | mootdx 实测不支持前复权（2026-05-21 gpt-5.2-codex 验证）|
-| baostock `query_profit/growth/balance_data` | GARP G增长因子多期YOY增速 | 新浪三表接口失效+历史深度不足（约20期）+字段标准化差 |
+| 原数据源 | 用途 | 当前替代 | 切回条件 |
+|--------|------|---------|---------|
+| baostock `adjustflag=2` | GARP 动量因子前复权K线 | **yfinance `auto_adjust=True`** ✅ | Azure NSG 开放出站 TCP 9898 → 验证通过 |
+| baostock `query_profit/growth/balance_data` | GARP G/Q因子多期财务增速 | **东财 `ZYZBAjaxNew`** ✅ | 同上 |
 
-**解除冻结条件：提供完整替代方案验证报告，经人工确认后方可迁移。**
+> baostock 代码完整保留在 `data/baostock_financial.py`，将 `DATA_SOURCE="baostock"` 可一键切回。
+> push2/push2his 系列：东财服务端对 Azure IP 返回空响应（非 NSG 问题），无法使用。
 
 ---
 
