@@ -31,7 +31,7 @@ import requests
 import uuid
 import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Any
 import pandas as pd
 
 # ─────────────────────────────────────────
@@ -811,9 +811,23 @@ def layer4_risk_check(
 REGIME_WEIGHTS = {
     "deep_bear":   {"G": 0.15, "Q": 0.45, "V": 0.25, "M": 0.05, "R": 0.10},
     "bear":        {"G": 0.20, "Q": 0.40, "V": 0.20, "M": 0.10, "R": 0.10},
-    "neutral":     {"G": 0.25, "Q": 0.35, "V": 0.15, "M": 0.15, "R": 0.10},  # 默认
-    "bull":        {"G": 0.35, "Q": 0.30, "V": 0.10, "M": 0.15, "R": 0.10},
-    "bubble":      {"G": 0.35, "Q": 0.25, "V": 0.10, "M": 0.20, "R": 0.10},
+    "neutral":     {"G": 0.20, "Q": 0.30, "V": 0.15, "M": 0.25, "R": 0.10},  # v3.0 默认：M提权
+    "bull":        {"G": 0.25, "Q": 0.25, "V": 0.10, "M": 0.30, "R": 0.10},
+    "accelerating_bull": {"G": 0.25, "Q": 0.20, "V": 0.10, "M": 0.35, "R": 0.10},
+    "bubble":      {"G": 0.10, "Q": 0.35, "V": 0.30, "M": 0.15, "R": 0.10},  # 状态5b：过热/泡沫预警
+}
+
+REGIME_ALIASES = {
+    "5b": "bubble",
+    "overheat": "bubble",
+    "overheated": "bubble",
+    "hot": "bubble",
+    "泡沫": "bubble",
+    "过热": "bubble",
+    "过热预警": "bubble",
+    "bubble_warning": "bubble",
+    "super_bull": "accelerating_bull",
+    "牛市加速": "accelerating_bull",
 }
 
 # PEG 阈值（与 market-regime.md §6.1 对齐）

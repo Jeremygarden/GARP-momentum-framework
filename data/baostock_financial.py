@@ -68,6 +68,17 @@ def _safe_float(val) -> Optional[float]:
         return None
 
 
+def _kline_is_fresh(df: pd.DataFrame, max_age_days: int = 7) -> bool:
+    """确认K线末条日期足够新鲜；过期动量不得沿用旧数据。"""
+    if df is None or df.empty or "date" not in df.columns:
+        return False
+    try:
+        latest = pd.to_datetime(df["date"].iloc[-1]).to_pydatetime()
+    except Exception:
+        return False
+    return (datetime.now() - latest) <= timedelta(days=max_age_days)
+
+
 def _to_em_secid(code: str) -> str:
     """东财 secid 格式：沪市1.xxxxxx，深市0.xxxxxx，指数特殊处理"""
     if code.startswith("0") and len(code) == 6 and code[0] == "0":
@@ -223,8 +234,11 @@ def _em_get_kline(secid: str, days: int = 200) -> pd.DataFrame:
 
 
 def _calc_momentum(stock_df: pd.DataFrame, index_df: pd.DataFrame) -> tuple[Optional[float], Optional[float]]:
-    """计算6M/1M超额动量，逻辑与 baostock 版本完全一致。"""
+    """计算6M/1M超额动量；K线超过7天视为过期，不使用旧值。"""
     if stock_df.empty or index_df.empty or len(stock_df) < 21:
+        return None, None
+    if not _kline_is_fresh(stock_df) or not _kline_is_fresh(index_df):
+        print("  [动量] K线超过7天或日期异常，返回 None 触发上层降级")
         return None, None
 
     n6m = min(126, len(stock_df) - 1)
@@ -284,6 +298,8 @@ def _get_financial_data_eastmoney(code: str) -> dict:
         "debt_ratio": fin.get("debt_ratio"),
         "momentum_6m_pct": momentum_6m,
         "momentum_1m_pct": momentum_1m,
+        "momentum_asof": stock_df["date"].iloc[-1] if not stock_df.empty else "",
+        "momentum_needs_refresh": momentum_6m is None,
         "fiscal_year": fin.get("fiscal_year", ""),
         "data_freshness": fin.get("data_freshness", ""),
         "source": "eastmoney",
@@ -434,6 +450,8 @@ def _get_financial_data_baostock(code: str, _session_active: bool = False) -> di
             "debt_ratio": debt_ratio,
             "momentum_6m_pct": momentum_6m,
             "momentum_1m_pct": momentum_1m,
+            "momentum_asof": kline_df["date"].iloc[-1] if not kline_df.empty else "",
+            "momentum_needs_refresh": momentum_6m is None,
             "fiscal_year": fiscal_year,
             "data_freshness": data_freshness,
             "source": "baostock",

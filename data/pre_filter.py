@@ -21,7 +21,7 @@ import json
 import time
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 import urllib.request
@@ -73,6 +73,7 @@ def _save_industry_cache(industry_map: dict[str, str]):
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
 OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "candidate_pool.json")
+CANDIDATE_POOL_TTL_DAYS = 7
 
 # mootdx industry 字段 → 证监会行业名称映射
 MOOTDX_INDUSTRY_MAP = {
@@ -502,6 +503,43 @@ def apply_quality_filter(
     return df_filtered
 
 
+
+def _parse_generated_at(value: str) -> Optional[datetime]:
+    """解析候选池 generated_at，兼容历史格式。"""
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value[:len(datetime.now().strftime(fmt))], fmt)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def candidate_pool_is_fresh(path: str = OUTPUT_PATH, ttl_days: int = CANDIDATE_POOL_TTL_DAYS) -> bool:
+    """候选池缓存 TTL 检查；超过 ttl_days 或格式异常均视为过期。"""
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        generated_at = _parse_generated_at(data.get("generated_at", ""))
+        if generated_at is None:
+            return False
+        age = datetime.now() - generated_at
+        return age <= timedelta(days=ttl_days)
+    except Exception:
+        return False
+
+
+def should_force_weekly_refresh(now: Optional[datetime] = None) -> bool:
+    """每周一强制全市场重扫，避免 cron 命中旧候选池。"""
+    now = now or datetime.now()
+    return now.weekday() == 0
+
 # ─────────────────────────────────────────
 # 主流程
 # ─────────────────────────────────────────
@@ -510,6 +548,9 @@ def run_pre_filter(
     use_sector_whitelist: bool = True,
     skip_quality_filter: bool = False,
     output_path: str = OUTPUT_PATH,
+    force_refresh: bool = False,
+    use_cache: bool = False,
+    ttl_days: int = CANDIDATE_POOL_TTL_DAYS,
 ) -> dict:
     """
     执行全流程预筛选，输出候选池 JSON。
@@ -517,11 +558,29 @@ def run_pre_filter(
     use_sector_whitelist: True=只保留目标赛道（严格，约50-100只）
                           False=仅排除黑名单行业（宽松，约150-250只）
     skip_quality_filter: True=跳过 mootdx 质量过滤（节省时间）
+    force_refresh: True=无条件全市场重扫
+    use_cache: True=允许在非周一且 TTL 有效时复用 candidate_pool.json（默认 False，确保动态运行）
+    ttl_days: 候选池缓存最长有效期，默认 7 天
     """
     t_start = time.time()
     print(f"\n{'='*60}")
     print(f"GARP 预筛选启动 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*60}")
+
+    weekly_refresh = should_force_weekly_refresh()
+    if weekly_refresh:
+        force_refresh = True
+        print("  [缓存策略] 周一执行：强制全市场重扫")
+
+    if use_cache and not force_refresh and candidate_pool_is_fresh(output_path, ttl_days):
+        print(f"  [缓存策略] candidate_pool.json TTL≤{ttl_days}天，按显式 use_cache 复用")
+        with open(output_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    if use_cache and not force_refresh:
+        print(f"  [缓存策略] 缓存不存在/超过{ttl_days}天/格式异常：执行实时重扫")
+    else:
+        print("  [缓存策略] 默认实时重扫：腾讯行情/行业/质量数据重新拉取")
 
     # Step 1: 全市场股票列表
     print("\n[Step 1] 获取全市场股票列表...")
@@ -602,6 +661,10 @@ def run_pre_filter(
         "filter_config": {
             "sector_whitelist": use_sector_whitelist,
             "quality_filter": not skip_quality_filter,
+            "ttl_days": ttl_days,
+            "force_refresh": force_refresh,
+            "use_cache": use_cache,
+            "weekly_force_refresh": weekly_refresh,
         },
         "candidates": candidate_list,
     }
@@ -622,11 +685,23 @@ def run_pre_filter(
 # 候选池读取工具（供 batch_garp_score 使用）
 # ─────────────────────────────────────────
 
-def load_candidate_pool(path: str = OUTPUT_PATH) -> list[dict]:
-    """读取候选池，返回标的列表。"""
+def load_candidate_pool(
+    path: str = OUTPUT_PATH,
+    max_age_days: int = CANDIDATE_POOL_TTL_DAYS,
+    auto_refresh: bool = True,
+) -> list[dict]:
+    """读取候选池；超过 TTL 时默认触发 run_pre_filter 重新扫描。"""
+    if not candidate_pool_is_fresh(path, max_age_days):
+        msg = f"[候选池] 缓存不存在或超过{max_age_days}天"
+        if auto_refresh:
+            print(msg + "，触发全市场重扫")
+            data = run_pre_filter(output_path=path, force_refresh=True)
+            return data.get("candidates", [])
+        raise RuntimeError(msg + "；请先运行 run_pre_filter(force_refresh=True)")
+
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    print(f"[候选池] {data['candidate_count']} 只，生成于 {data['generated_at']}")
+    print(f"[候选池] {data['candidate_count']} 只，生成于 {data['generated_at']}（TTL≤{max_age_days}天）")
     return data["candidates"]
 
 
@@ -661,6 +736,8 @@ if __name__ == "__main__":
     parser.add_argument("--wide", action="store_true", help="宽松模式（行业黑名单排除，而非白名单）")
     parser.add_argument("--skip-quality", action="store_true", help="跳过质量过滤（节省~1分钟）")
     parser.add_argument("--summary", action="store_true", help="打印已有候选池摘要")
+    parser.add_argument("--use-cache", action="store_true", help="非周一且TTL有效时允许复用候选池缓存（默认实时重扫）")
+    parser.add_argument("--force-refresh", action="store_true", help="强制重扫候选池")
     args = parser.parse_args()
 
     if args.summary:
@@ -672,4 +749,6 @@ if __name__ == "__main__":
         run_pre_filter(
             use_sector_whitelist=not args.wide,
             skip_quality_filter=args.skip_quality,
+            force_refresh=args.force_refresh,
+            use_cache=args.use_cache,
         )
