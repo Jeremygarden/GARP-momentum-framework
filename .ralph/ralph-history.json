@@ -57,29 +57,59 @@
         "2026-06-14T12:48:28.613061Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses",
         "ERROR: Reconnecting... 5/5"
       ]
+    },
+    {
+      "iteration": 3,
+      "startedAt": "2026-06-14T12:48:40.979Z",
+      "endedAt": "2026-06-14T12:48:58.841Z",
+      "durationMs": 17792,
+      "agent": "codex",
+      "model": "github-copilot/gpt-5.5",
+      "toolsUsed": {},
+      "filesModified": [],
+      "exitCode": 1,
+      "completionDetected": false,
+      "errors": [
+        "2026-06-14T12:48:41.783038Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses",
+        "2026-06-14T12:48:42.330094Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses",
+        "2026-06-14T12:48:43.054493Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses",
+        "ERROR: Reconnecting... 2/5",
+        "2026-06-14T12:48:43.984963Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses",
+        "ERROR: Reconnecting... 3/5",
+        "2026-06-14T12:48:45.327977Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses",
+        "ERROR: Reconnecting... 4/5",
+        "2026-06-14T12:48:47.401608Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses",
+        "ERROR: Reconnecting... 5/5"
+      ]
     }
   ],
-  "totalDurationMs": 36591,
+  "totalDurationMs": 54383,
   "struggleIndicators": {
     "repeatedErrors": {
       "2026-06-14T12:48:03.127493Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
       "2026-06-14T12:48:03.919880Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
       "2026-06-14T12:48:04.710421Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
-      "ERROR: Reconnecting... 2/5": 2,
+      "ERROR: Reconnecting... 2/5": 3,
       "2026-06-14T12:48:05.638914Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
-      "ERROR: Reconnecting... 3/5": 2,
+      "ERROR: Reconnecting... 3/5": 3,
       "2026-06-14T12:48:07.120208Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
-      "ERROR: Reconnecting... 4/5": 2,
+      "ERROR: Reconnecting... 4/5": 3,
       "2026-06-14T12:48:09.295555Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
-      "ERROR: Reconnecting... 5/5": 2,
+      "ERROR: Reconnecting... 5/5": 3,
       "2026-06-14T12:48:22.977307Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
       "2026-06-14T12:48:23.515340Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
       "2026-06-14T12:48:24.237032Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
       "2026-06-14T12:48:25.153962Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
       "2026-06-14T12:48:26.470964Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
-      "2026-06-14T12:48:28.613061Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1
+      "2026-06-14T12:48:28.613061Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
+      "2026-06-14T12:48:41.783038Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
+      "2026-06-14T12:48:42.330094Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
+      "2026-06-14T12:48:43.054493Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
+      "2026-06-14T12:48:43.984963Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
+      "2026-06-14T12:48:45.327977Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1,
+      "2026-06-14T12:48:47.401608Z ERROR codex_api::endpoint::responses_websocket: failed to connect to web": 1
     },
-    "noProgressIterations": 0,
-    "shortIterations": 2
+    "noProgressIterations": 1,
+    "shortIterations": 3
   }
 }
