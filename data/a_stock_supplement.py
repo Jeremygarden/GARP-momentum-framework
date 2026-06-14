@@ -1276,6 +1276,77 @@ def get_today_north_net_flow() -> Optional[float]:
     return None
 
 
+# ════════════════════════════════════════════════════════════════════
+# v3.0 产业链传导动量计算
+# ════════════════════════════════════════════════════════════════════
+
+# 产业链传导图谱：下游龙头 → 中游平台 → 上游材料
+# 简化映射：行业代码 → 上游依赖产业链代码
+# 下游择优态势市场 = AI算力(光模块中高笤10,24)/电力设备(30)/车载送(28)
+# 中游层 = PCB(11)+CCL+模块岁数(24)
+# 上游材料层 = 精密陶瓷(10)+区域靨(19)+石英顺材料(17)+有色冶炼(14)
+_CHAIN_UPSTREAM_MAP: dict[str, list[str]] = {
+    # 下游光模块/CPO→中游PCB/CCL→上游精密陶瓷/石英/纤维
+    "24": ["11", "10", "17", "19"],  # 电子局很高
+    # 下游新能源汽车→中游电子元器件→上游精密刻度/磁性材料
+    "28": ["24", "10", "14"],
+    # 下游电力设备→上游精密金属/功能材料
+    "30": ["14", "19", "10"],
+    # 下游工控/机器人→中游专用设备→上游特种陶瓷/贵金属
+    "26": ["10", "25", "14"],
+}
+
+# 下游市场景气代表标的：用主力资金流入委托产业链优势。
+# 当 `code` 的行业代码属于某条产业链的上游层，且下游层标的资金有流入，则上游标的得分拐弗。
+
+
+def compute_industry_chain_score(
+    code: str,
+    industry_code: Optional[Any],
+    fund_flow_signal: str = "neutral",
+) -> Optional[float]:
+    """
+    计算个股的产业链传导动量得分（0-100）。
+
+    逻辑：
+    1. 判断该行业代码是否为某一产业链的上游。
+    2. 找到对应的下游行业代码。
+    3. 用下游行业内目标标的的资金流入信号作为传导工具。
+    4. 当下游多标的资金流入“投票”，上游标的得高分（传导延迟效应）。
+
+    当前实现：轻量版，用当前标的自身资金流信号 + 下游层行业代码则利(将来接入下游龙头资金流)。
+    返回 None 则 _score_m 回落到研报评级兴容模式。
+    """
+    ind = str(industry_code).strip() if industry_code is not None else None
+    if ind is None:
+        return None
+
+    # 判断是否属于某条产业链的上游
+    is_upstream = False
+    downstream_codes: list[str] = []
+    for downstream_code, upstream_codes in _CHAIN_UPSTREAM_MAP.items():
+        if ind in upstream_codes:
+            is_upstream = True
+            downstream_codes.append(downstream_code)
+
+    # 评分逻辑：上游标的用下游行业局势 + 自身资金流
+    if is_upstream:
+        # 下游行业处于高景气层：传导得分拐弗
+        # 当前简化：下游层优势 = 下游行业代码属于已知突破赛道
+        hot_downstream = {"24", "30", "26", "28"}  # 光模块/电力/工控/汽车
+        hot_count = len([c for c in downstream_codes if c in hot_downstream])
+        if fund_flow_signal == "bullish":
+            base = 80.0 + hot_count * 5  # 自身资金+下游局势双共振
+        elif fund_flow_signal == "bearish":
+            base = 35.0  # 就算是上游，如果自身资金流出，传导信号弱
+        else:
+            base = 58.0 + hot_count * 4  # 中性主力但下游局势加分
+        return round(min(100.0, base), 1)
+    else:
+        # 不属于已知产业链上游，返回 None → _score_m 回落研报兼容模式
+        return None
+
+
 # PEG 阈值（与 market-regime.md §6.1 对齐）
 PEG_THRESHOLDS = {
     "deep_bear":  {"good": 0.5, "ok": 0.7,  "max": 1.0},
