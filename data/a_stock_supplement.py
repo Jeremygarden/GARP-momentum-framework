@@ -540,6 +540,14 @@ def compare_reports_with_miaoxiang(
     ]
     eps_consensus = round(sum(eps_values) / len(eps_values), 3) if eps_values else None
 
+    latest_report_date = eastmoney_reports[0].get("date") if eastmoney_reports else None
+    age_days = _days_since(latest_report_date)
+    confidence = "⭐⭐⭐⭐⭐"
+    if age_days is not None and age_days > 150:
+        confidence = "⭐⭐⭐"
+    elif age_days is not None and age_days > 90:
+        confidence = "⭐⭐⭐⭐"
+
     return {
         "em_count": len(eastmoney_reports),
         "mx_count": len(miaoxiang_reports),
@@ -547,6 +555,9 @@ def compare_reports_with_miaoxiang(
         "mx_latest_rating": mx_latest,
         "rating_consistent": em_latest == mx_latest,
         "eps_consensus_from_em": eps_consensus,
+        "latest_report_date": latest_report_date,
+        "report_age_days": age_days,
+        "consensus_confidence": confidence,
     }
 
 
@@ -829,6 +840,197 @@ REGIME_ALIASES = {
     "super_bull": "accelerating_bull",
     "牛市加速": "accelerating_bull",
 }
+
+def normalize_regime(regime: Optional[str]) -> str:
+    """Normalize market regime aliases to REGIME_WEIGHTS keys."""
+    key = str(regime or "neutral").strip()
+    lower = key.lower()
+    return REGIME_ALIASES.get(key) or REGIME_ALIASES.get(lower) or (lower if lower in REGIME_WEIGHTS else "neutral")
+
+
+def _parse_date(value) -> Optional[datetime]:
+    """解析 YYYY-MM-DD / YYYY-MM / ISO 日期；失败返回 None。"""
+    if not value:
+        return None
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text[:len(datetime.now().strftime(fmt))], fmt)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _days_since(value) -> Optional[int]:
+    dt = _parse_date(value)
+    if dt is None:
+        return None
+    return (datetime.now() - dt).days
+
+
+def check_data_freshness(candidate: dict) -> dict:
+    """检查候选标的数据新鲜度，过期数据降级或触发重取。
+
+    - G/Q/V数据：超过季报周期(90天)标注⚠️
+    - M动量：超过7天标注需重新计算
+    - 研报一致预期：超过150天降级为⭐⭐⭐
+    """
+    checked = dict(candidate or {})
+    freshness = dict(checked.get("freshness", {}) or {})
+    flags = list(checked.get("freshness_flags", []) or [])
+
+    gqv_asof = (
+        checked.get("gqv_asof") or checked.get("financial_asof") or
+        checked.get("data_freshness") or checked.get("report_date")
+    )
+    gqv_age = _days_since(gqv_asof)
+    freshness["gqv_age_days"] = gqv_age
+    if gqv_age is None:
+        flags.append("⚠️ G/Q/V数据日期缺失")
+    elif gqv_age > 90:
+        flags.append(f"⚠️ G/Q/V数据超过90天({gqv_age}天)")
+
+    momentum_asof = checked.get("momentum_asof") or checked.get("m_asof")
+    m_age = _days_since(momentum_asof)
+    freshness["momentum_age_days"] = m_age
+    if m_age is None:
+        flags.append("⚠️ M动量日期缺失，需重新计算")
+        checked["momentum_needs_refresh"] = True
+    elif m_age > 7:
+        flags.append(f"⚠️ M动量超过7天({m_age}天)，需重新计算")
+        checked["momentum_needs_refresh"] = True
+    else:
+        checked["momentum_needs_refresh"] = False
+
+    consensus_asof = (
+        checked.get("consensus_asof") or checked.get("report_asof") or
+        checked.get("latest_report_date")
+    )
+    consensus_age = _days_since(consensus_asof)
+    freshness["consensus_age_days"] = consensus_age
+    if consensus_age is not None and consensus_age > 150:
+        flags.append(f"⚠️ 研报一致预期超过150天({consensus_age}天)，置信度降级为⭐⭐⭐")
+        checked["consensus_confidence"] = "⭐⭐⭐"
+        if checked.get("report_rating_trend") in ("upgrade", "downgrade"):
+            checked["report_rating_trend"] = "stable"
+    elif consensus_age is not None and consensus_age > 90:
+        flags.append(f"⚠️ 研报一致预期超过90天({consensus_age}天)")
+
+    checked["freshness"] = freshness
+    checked["freshness_flags"] = list(dict.fromkeys(flags))
+    return checked
+
+
+def _linear_slope(values: list[float]) -> Optional[float]:
+    n = len(values)
+    if n < 2:
+        return None
+    xs = list(range(n))
+    xbar = sum(xs) / n
+    ybar = sum(values) / n
+    denom = sum((x - xbar) ** 2 for x in xs)
+    if denom == 0:
+        return None
+    return sum((x - xbar) * (y - ybar) for x, y in zip(xs, values)) / denom
+
+
+def is_overheat_bubble_warning(
+    pe_percentile: Optional[float],
+    erp_pct: Optional[float],
+    broad_index_1m_return_pct: Optional[float] = None,
+    require_index_surge: bool = False,
+) -> bool:
+    """v3.0 状态5b：PE分位>90% AND ERP<0.5%，可选叠加宽基1月涨幅>20%。"""
+    if pe_percentile is None or erp_pct is None:
+        return False
+    hot_valuation = pe_percentile > 90 and erp_pct < 0.5
+    if not hot_valuation:
+        return False
+    if require_index_surge:
+        return broad_index_1m_return_pct is not None and broad_index_1m_return_pct > 20
+    return True
+
+
+def detect_market_regime(
+    pe_percentile: Optional[float] = None,
+    north_10d_flow_yi: Optional[float] = None,
+    volatility_pct: Optional[float] = None,
+    erp_pct: Optional[float] = None,
+    broad_index_1m_return_pct: Optional[float] = None,
+) -> str:
+    """轻量市场状态判断；优先识别5b过热/泡沫预警，其余按四变量投票回落。"""
+    if is_overheat_bubble_warning(pe_percentile, erp_pct, broad_index_1m_return_pct):
+        return "bubble"
+    votes: list[str] = []
+    if pe_percentile is not None:
+        if pe_percentile < 30: votes.append("deep_bear")
+        elif pe_percentile < 50: votes.append("bear")
+        elif pe_percentile < 70: votes.append("neutral")
+        elif pe_percentile < 85: votes.append("bull")
+        else: votes.append("accelerating_bull")
+    if north_10d_flow_yi is not None:
+        if north_10d_flow_yi < -200: votes.append("deep_bear")
+        elif north_10d_flow_yi < -50: votes.append("bear")
+        elif north_10d_flow_yi <= 50: votes.append("neutral")
+        elif north_10d_flow_yi <= 200: votes.append("bull")
+        else: votes.append("accelerating_bull")
+    if volatility_pct is not None:
+        if volatility_pct > 35: votes.append("deep_bear")
+        elif volatility_pct > 25: votes.append("bear")
+        elif volatility_pct >= 15: votes.append("neutral")
+        else: votes.append("accelerating_bull")
+    if erp_pct is not None:
+        if erp_pct > 6: votes.append("deep_bear")
+        elif erp_pct > 4.5: votes.append("bear")
+        elif erp_pct >= 3: votes.append("neutral")
+        elif erp_pct >= 2: votes.append("bull")
+        else: votes.append("accelerating_bull")
+    if not votes:
+        return "neutral"
+    counts = {v: votes.count(v) for v in set(votes)}
+    best, count = max(counts.items(), key=lambda kv: kv[1])
+    if count >= 2:
+        return best
+    return normalize_regime(votes[0])
+
+
+def get_north_flow_slope(code: Optional[str] = None, days: int = 20) -> Optional[float]:
+    """获取北向资金20日净流入斜率（亿元/天）；失败返回 None 以触发 _score_m 回落。
+
+    `code` 预留给未来个股级北向持仓扩展；当前口径为市场级北向净流入趋势。
+    """
+    _ = code
+    try:
+        lmt = max(days + 5, 25)
+        url = _push2his_url("/api/qt/kamt.kline/get")
+        params = {
+            "fields1": "f1,f2,f3,f4",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57",
+            "klt": "101",
+            "lmt": str(lmt),
+        }
+        r = requests.get(url, params=params, headers={"User-Agent": UA, "Referer": "https://data.eastmoney.com/"}, timeout=10)
+        d = r.json()
+        klines = (d.get("data") or {}).get("klines") or []
+        flows: list[float] = []
+        for line in klines[-lmt:]:
+            nums = []
+            for item in str(line).split(",")[1:]:
+                try:
+                    nums.append(float(item))
+                except Exception:
+                    continue
+            if nums:
+                flows.append(nums[2] if len(nums) >= 3 else nums[-1])
+        slope = _linear_slope(flows[-days:])
+        return round(slope, 3) if slope is not None else None
+    except Exception as e:
+        print(f"[WARN] 北向资金斜率获取失败: {e}")
+        return None
+
 
 # PEG 阈值（与 market-regime.md §6.1 对齐）
 PEG_THRESHOLDS = {
@@ -1467,6 +1669,13 @@ def batch_garp_score(
                 mx_signal=fin.get("mx_signal"),
                 mx_score=fin.get("mx_score"),
                 sector_quality=sq,
+                north_flow_slope=fin.get("north_flow_slope"),
+                industry_chain_score=fin.get("industry_chain_score"),
+                data_asof={
+                    "data_freshness": fin.get("data_freshness"),
+                    "momentum_asof": fin.get("momentum_asof"),
+                    "consensus_asof": fin.get("consensus_asof") or fin.get("latest_report_date"),
+                },
             )
             return result
         except Exception as e:
@@ -1517,6 +1726,9 @@ def auto_garp_score(
     mx_signal: Optional[str] = None,
     mx_score: Optional[float] = None,
     sector_quality: Optional[dict] = None,
+    north_flow_slope: Optional[float] = None,
+    industry_chain_score: Optional[float] = None,
+    data_asof: Optional[dict] = None,
 ) -> dict:
     """
     GARP 五因子 AI 自动评分（轻量版）。
@@ -1525,6 +1737,8 @@ def auto_garp_score(
     sector_quality: 传入则 G 因子根据赛道质量做加成/降级调整。
     """
     trade_date = datetime.now().strftime("%Y-%m-%d")
+    requested_regime = regime
+    regime = normalize_regime(regime)
     weights = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS["neutral"])
 
     # 自动获取行情
@@ -1545,6 +1759,12 @@ def auto_garp_score(
         fund_flow_signal = ff.get("signal", "neutral")
     except Exception:
         pass
+
+    if north_flow_slope is None:
+        try:
+            north_flow_slope = get_north_flow_slope(code)
+        except Exception:
+            north_flow_slope = None
 
     lockup_risk = "none"
     try:
@@ -1573,8 +1793,9 @@ def auto_garp_score(
     if report_rating_trend is None:
         try:
             reports = get_eastmoney_reports(code, max_pages=1)
-            if len(reports) >= 2:
-                recent_ratings = [r["rating"] for r in reports[:5] if r.get("rating")]
+            fresh_reports = [r for r in reports if (_days_since(r.get("date")) is not None and _days_since(r.get("date")) <= 150)]
+            if len(fresh_reports) >= 2:
+                recent_ratings = [r["rating"] for r in fresh_reports[:5] if r.get("rating")]
                 buy_count = sum(1 for r in recent_ratings if "买入" in r or "增持" in r)
                 sell_count = sum(1 for r in recent_ratings if "减持" in r or "卖出" in r)
                 if buy_count >= 3:
@@ -1583,6 +1804,8 @@ def auto_garp_score(
                     report_rating_trend = "downgrade"
                 else:
                     report_rating_trend = "stable"
+            else:
+                report_rating_trend = "stable"
         except Exception:
             report_rating_trend = "stable"
 
@@ -1597,7 +1820,13 @@ def auto_garp_score(
     g_score, g_note = _score_g_with_sector(revenue_cagr_3y, eps_cagr_3y, consensus_eps_growth, sector_quality)
     q_score, q_note = _score_q(roe, gross_margin, debt_ratio)
     v_score, v_note = _score_v(pe_ttm, pb, g_adjusted_pct, regime)
-    m_score, m_note = _score_m(momentum_6m_pct, fund_flow_signal, report_rating_trend)
+    m_score, m_note = _score_m(
+        momentum_6m_pct,
+        fund_flow_signal,
+        report_rating_trend,
+        north_flow_slope=north_flow_slope,
+        industry_chain_score=industry_chain_score,
+    )
     r_score, veto, r_note = _score_r(lockup_risk, dragon_tiger_signal, cls_alerts)
 
     # 加权总分
@@ -1651,10 +1880,20 @@ def auto_garp_score(
     else:
         recommendation = "建议减仓或剔除"
 
+    freshness_input = {
+        "code": code,
+        "data_freshness": (data_asof or {}).get("data_freshness") if data_asof else None,
+        "momentum_asof": (data_asof or {}).get("momentum_asof") if data_asof else None,
+        "consensus_asof": (data_asof or {}).get("consensus_asof") if data_asof else None,
+        "report_rating_trend": report_rating_trend,
+    }
+    freshness_checked = check_data_freshness(freshness_input)
+
     return {
         "code": code,
         "name": tc_data.get("name", ""),
         "regime": regime,
+        "requested_regime": requested_regime,
         "scores": {"G": g_score, "Q": q_score, "V": v_score, "M": m_score, "R": r_score},
         "weights": {k: f"{v*100:.0f}%" for k, v in weights.items()},
         "factor_notes": {"G": g_note, "Q": q_note, "V": v_note, "M": m_note, "R": r_note},
@@ -1670,7 +1909,11 @@ def auto_garp_score(
             "lockup_risk": lockup_risk,
             "dragon_tiger": dragon_tiger_signal,
             "report_trend": report_rating_trend,
+            "north_flow_slope": north_flow_slope,
+            "industry_chain_score": industry_chain_score,
         },
+        "freshness": freshness_checked.get("freshness", {}),
+        "freshness_flags": freshness_checked.get("freshness_flags", []),
         "sector_quality": sector_quality,
     }
 

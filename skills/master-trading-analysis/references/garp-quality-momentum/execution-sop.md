@@ -405,11 +405,31 @@ Step 6 群聊发送榜单（见步骤7.3格式）
   "payload": {
     "kind": "agentTurn",
     "agentId": "investor",
-    "message": "AUTONOMOUS: 执行 GARP+质量动能 v2.0 Top15 榜单周刷新。\n1. 读取 workspace-investor/skills/master-trading-analysis/references/garp-quality-momentum/execution-sop.md\n2. 执行步骤0（市场状态判断）\n3. 本次为M动量全量刷新（检查今日是否为 2.1/5.1/8.1/11.1，是则完整刷新G/Q/V；检查是否为 2.1/4.30/7.15/10.15，是则刷新一致预期数据）\n4. 对当前 Top15 标的更新评分，与上期对比生成排名变化标记\n5. 识别新进入标的（黑马），补充入榜实证和触发因子\n6. 按步骤7.3格式输出榜单，发至飞书群 oc_46eca9a74d93d00943a00a3ce6c3b75b\n7. 同步入库 Bitable（步骤8）"
+    "message": "AUTONOMOUS: 执行 GARP+质量动能 v2.0 Top15 榜单周刷新。\n1. 读取 workspace-investor/skills/master-trading-analysis/references/garp-quality-momentum/execution-sop.md\n2. 执行步骤0（市场状态判断）\n3. 必须先执行全流程动态数据刷新：调用 data/pre_filter.py 的 run_pre_filter(force_refresh=True, use_cache=False)；禁止直接复用 candidate_pool.json；腾讯行情/PE/PB/换手率必须实时拉取；K线动量必须重新拉取最新数据并检查 freshness_flags\n4. 本次为M动量全量刷新（检查今日是否为 2.1/5.1/8.1/11.1，是则完整刷新G/Q/V；检查是否为 2.1/4.30/7.15/10.15，是则刷新一致预期数据）\n5. 对当前 Top15 标的更新评分，与上期对比生成排名变化标记\n6. 识别新进入标的（黑马），补充入榜实证和触发因子\n7. 按步骤7.3格式输出榜单，发至飞书群 oc_46eca9a74d93d00943a00a3ce6c3b75b\n8. 同步入库 Bitable（步骤8）"
   }
 }
 ```
 
+
+
+### 月度候补池全量扫描 Cron（必须启用）
+
+> 配置路径：`/home/azureuser/.openclaw/cron/jobs.json`
+
+```json
+{
+  "id": "garp-pipeline-monthly-full-scan",
+  "description": "GARP候补池/观察池每月1日全量扫描",
+  "schedule": "0 3 1 * *",
+  "timezone": "UTC",
+  "sessionTarget": "isolated",
+  "payload": {
+    "kind": "agentTurn",
+    "agentId": "investor",
+    "message": "AUTONOMOUS: 执行 GARP v2.0 候补池 Pipeline 每月全量扫描与观察池刷新。强制调用 run_pre_filter(force_refresh=True, use_cache=False)，禁止复用 candidate_pool.json；腾讯行情与K线动量必须实时重取；执行 check_data_freshness 并同步候补池/观察池 Bitable。"
+  }
+}
+```
 ---
 
 ## 输出格式（标准JSON，内部评分用）
