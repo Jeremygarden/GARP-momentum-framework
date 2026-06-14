@@ -2007,8 +2007,7 @@ def auto_garp_score(
     """
     trade_date = datetime.now().strftime("%Y-%m-%d")
     requested_regime = regime
-    regime = normalize_regime(regime)
-    regime_adjustment = None
+    regime, regime_adjustment = _canonical_regime(regime)
     if is_overheat_bubble_warning(pe_percentile, erp_pct, broad_index_1m_return_pct):
         regime = "bubble"
         regime_adjustment = "状态5b触发：全A PE分位>90%且ERP<0.5%"
