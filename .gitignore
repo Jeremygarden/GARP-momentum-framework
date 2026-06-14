@@ -17,3 +17,7 @@ SOUL.md
 TOOLS.md
 USER.md
 skills/master-trading-analysis/references/analysts/
+
+# Python cache
+__pycache__/
+*.pyc

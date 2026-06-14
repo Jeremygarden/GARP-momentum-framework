@@ -574,6 +574,10 @@ def get_cls_telegraph(page_size: int = 50) -> list[dict]:
     替代 Tavily 爬取方案，稳定性更高。
     返回: [{title, content, time, stocks}]
     stocks: 关联股票代码列表（cls 直接提供，可 JOIN 持仓）
+
+    ⚠️ 2026-06 状态：CLS nodeapi/telegraphList 返回 404，
+    已迁移至需签名的 v1/roll/get_roll_list。本接口静默返回空列表，
+    R 因子的 CLS 子组件安全降级（不影响龙虎榜/限售解禁判断）。
     """
     url = "https://www.cls.cn/nodeapi/telegraphList"
     params = {"rn": str(page_size), "page": "1"}
@@ -581,6 +585,9 @@ def get_cls_telegraph(page_size: int = 50) -> list[dict]:
 
     try:
         r = requests.get(url, params=params, headers=headers, timeout=10)
+        if r.status_code != 200:
+            # API 已迁移/失效，静默返回空（不打印错误避免刷屏）
+            return []
         d = r.json()
         rows = []
         for item in d.get("data", {}).get("roll_data", []):
@@ -596,8 +603,7 @@ def get_cls_telegraph(page_size: int = 50) -> list[dict]:
                 "stocks": stocks,
             })
         return rows
-    except Exception as e:
-        print(f"[ERROR] 财联社快讯获取失败: {e}")
+    except Exception:
         return []
 
 
@@ -1576,7 +1582,8 @@ def _score_v(pe_ttm: Optional[float],
             track = "消费/医药PEG轨" if code in CONSUMER_MEDICAL_INDUSTRY_CODES else "PEG轨"
             note = f"{track}(行业代码{code}): {note}"
 
-    if pb is not None:
+    if pb is not None and not use_scarcity:
+        # PB修正仅对非稀缺性模型生效；稀缺性模型中高PB是护城河特征，不应双重惩罚
         if pb < 1: score = min(100, score + 5)
         elif pb > 10: score = max(0, score - 5)
     if canonical_regime == "bubble" and g_adjusted_pct and g_adjusted_pct > 0:
