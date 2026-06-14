@@ -848,6 +848,17 @@ def normalize_regime(regime: Optional[str]) -> str:
     return REGIME_ALIASES.get(key) or REGIME_ALIASES.get(lower) or (lower if lower in REGIME_WEIGHTS else "neutral")
 
 
+def _canonical_regime(regime: Optional[str]) -> tuple[str, Optional[str]]:
+    raw = str(regime or "neutral").strip()
+    canonical = normalize_regime(raw)
+    note = None
+    if canonical != raw:
+        note = f"市场状态{raw}映射为{canonical}权重"
+    if canonical == "bubble":
+        note = (note + "；" if note else "") + "状态5b过热预警：V权重上调为刹车，M/G降权"
+    return canonical, note
+
+
 def _parse_date(value) -> Optional[datetime]:
     """解析 YYYY-MM-DD / YYYY-MM / ISO 日期；失败返回 None。"""
     if not value:
@@ -997,12 +1008,94 @@ def detect_market_regime(
     return normalize_regime(votes[0])
 
 
-def get_north_flow_slope(code: Optional[str] = None, days: int = 20) -> Optional[float]:
-    """获取北向资金20日净流入斜率（亿元/天）；失败返回 None 以触发 _score_m 回落。
+def _extract_jsonp(payload: str) -> Any:
+    """解析东财普通 JSON 或 JSONP。"""
+    import json
+    text = payload.strip()
+    if "(" in text and text.endswith(")"):
+        text = text[text.find("(") + 1:-1]
+    return json.loads(text)
 
+
+def _to_float(value: Any) -> Optional[float]:
+    """稳健数字转换，兼容东财 '-' / None / 字符串。"""
+    if value is None or value == "" or value == "-":
+        return None
+    try:
+        return float(str(value).replace(",", ""))
+    except Exception:
+        return None
+
+
+def get_north_flow_slope(code: Optional[str] = None, days: int = 20) -> Optional[float]:
+    """
+    获取北向资金近20日净流入斜率（亿元/天）。
+
+    数据源：东方财富北向资金 HTTP 接口。优先 datacenter 历史日频，
+    备用 push2his 历史 K 线，再备用 push2 实时分钟 JSONP。
+    返回：float（正=净流入加速，负=净流出/流入减速），None=不可用。
     `code` 预留给未来个股级北向持仓扩展；当前口径为市场级北向净流入趋势。
     """
     _ = code
+    headers = {"User-Agent": UA, "Referer": "https://data.eastmoney.com/hsgtcg/"}
+
+    history_candidates = [
+        {
+            "reportName": "RPT_MUTUAL_DEAL_HISTORY",
+            "columns": "ALL",
+            "pageNumber": "1",
+            "pageSize": "30",
+            "sortColumns": "TRADE_DATE",
+            "sortTypes": "-1",
+            "source": "WEB",
+            "client": "WEB",
+        },
+        {
+            "reportName": "RPT_NORTH_NETFLOWIN",
+            "columns": "ALL",
+            "pageNumber": "1",
+            "pageSize": "30",
+            "sortColumns": "TRADE_DATE",
+            "sortTypes": "-1",
+            "source": "WEB",
+            "client": "WEB",
+        },
+    ]
+    flow_keys = (
+        "NET_BUY_AMT", "NETBUYAMT", "NET_BUY_AMOUNT", "NET_BUY_AMT_SHSZ",
+        "BUY_AMT", "NET_FLOW", "NETFLOW", "HGT_NET_AMT", "SGT_NET_AMT",
+        "NORTH_NET_INFLOW", "VALUE",
+    )
+    date_keys = ("TRADE_DATE", "TRADEDATE", "DATE", "TRADE_DATE_STR")
+
+    for params in history_candidates:
+        try:
+            r = requests.get(DATACENTER_URL, params=params, headers=headers, timeout=12)
+            d = _extract_jsonp(r.text)
+            rows = (((d or {}).get("result") or {}).get("data") or [])
+            parsed: list[tuple[str, float]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                val = None
+                for key in flow_keys:
+                    if key in row:
+                        val = _to_float(row.get(key))
+                        if val is not None:
+                            break
+                if val is None:
+                    continue
+                if abs(val) > 10000:  # 元 → 亿元
+                    val = val / 100000000
+                date = next((str(row.get(k)) for k in date_keys if row.get(k)), "")
+                parsed.append((date, val))
+            if len(parsed) >= 2:
+                parsed.sort(key=lambda x: x[0])
+                slope = _linear_slope([v for _, v in parsed[-days:]])
+                return round(slope, 3) if slope is not None else None
+        except Exception as e:
+            print(f"[WARN] 北向历史资金接口不可用: {e}")
+
     try:
         lmt = max(days + 5, 25)
         url = _push2his_url("/api/qt/kamt.kline/get")
@@ -1012,25 +1105,50 @@ def get_north_flow_slope(code: Optional[str] = None, days: int = 20) -> Optional
             "klt": "101",
             "lmt": str(lmt),
         }
-        r = requests.get(url, params=params, headers={"User-Agent": UA, "Referer": "https://data.eastmoney.com/"}, timeout=10)
-        d = r.json()
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        d = _extract_jsonp(r.text)
         klines = (d.get("data") or {}).get("klines") or []
         flows: list[float] = []
         for line in klines[-lmt:]:
-            nums = []
-            for item in str(line).split(",")[1:]:
-                try:
-                    nums.append(float(item))
-                except Exception:
-                    continue
+            nums = [_to_float(item) for item in str(line).split(",")[1:]]
+            nums = [x for x in nums if x is not None]
             if nums:
                 flows.append(nums[2] if len(nums) >= 3 else nums[-1])
         slope = _linear_slope(flows[-days:])
-        return round(slope, 3) if slope is not None else None
+        if slope is not None:
+            return round(slope, 3)
     except Exception as e:
-        print(f"[WARN] 北向资金斜率获取失败: {e}")
-        return None
+        print(f"[WARN] 北向push2his资金接口不可用: {e}")
 
+    try:
+        cb = f"jQuery{int(time.time() * 1000)}"
+        url = _push2_url("/api/qt/kamt.rtmin/get")
+        params = {
+            "fields1": "f1,f2,f3,f4",
+            "fields2": "f51,f52",
+            "ut": "b2884a393a59ad64002292a3e90d46a5",
+            "cb": cb,
+        }
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        d = _extract_jsonp(r.text)
+        data = (d or {}).get("data") or {}
+        trends = data.get("s2n") or data.get("hk2sh") or data.get("hk2sz") or data.get("trends") or []
+        values = []
+        for item in trends:
+            parts = item.split(",") if isinstance(item, str) else item
+            if isinstance(parts, (list, tuple)) and len(parts) >= 2:
+                val = _to_float(parts[1])
+                if val is not None:
+                    if abs(val) > 10000:
+                        val = val / 100000000
+                    values.append(val)
+        if len(values) >= 2:
+            minute_slope = _linear_slope(values[-240:])
+            return round(minute_slope * 240, 3) if minute_slope is not None else None
+    except Exception as e:
+        print(f"[WARN] 北向实时资金接口不可用: {e}")
+
+    return None
 
 # PEG 阈值（与 market-regime.md §6.1 对齐）
 PEG_THRESHOLDS = {
@@ -1073,72 +1191,203 @@ def _score_g(revenue_cagr_3y: Optional[float],
     return float(score), note
 
 
-def _score_q(roe: Optional[float],
-             gross_margin: Optional[float],
-             debt_ratio: Optional[float]) -> tuple[float, str]:
+
+CONSUMER_MEDICAL_INDUSTRY_CODES = {"15", "20", "37", "49"}
+SCARCE_TECH_MANUFACTURING_CODES = {"10", "11", "13", "14", "17", "24"}
+SCARCITY_PREMIUMS = {
+    "unique": 1.50, "global_unique": 1.50, "domestic_unique": 1.50,
+    "唯一": 1.50, "全球唯一": 1.50, "国内唯一": 1.50,
+    "2-3": 0.80, "2_3": 0.80, "2-3家": 0.80, "oligopoly": 0.80, "寡头": 0.80,
+    "top5": 0.40, "within5": 0.40, "5家以内": 0.40,
+    "competitive": 0.0, "充分竞争": 0.0, "none": 0.0,
+}
+
+def _scarcity_subscore_from_slope(domestic_substitution_slope: Optional[float]) -> Optional[float]:
+    """国产替代率提升斜率子分：近8季度市占率Δ>5pct满分；下滑0分。"""
+    if domestic_substitution_slope is None:
+        return None
+    slope = float(domestic_substitution_slope)
+    if slope <= 0:
+        return 0.0
+    if slope >= 5:
+        return 100.0
+    return round(slope / 5 * 100, 1)
+
+
+def _scarcity_subscore_from_replacement_cost(replacement_cost_to_mcap: Optional[float]) -> Optional[float]:
+    """重置成本/市值比子分：>2=100，1-2=70，<1=40。"""
+    if replacement_cost_to_mcap is None:
+        return None
+    ratio = float(replacement_cost_to_mcap)
+    if ratio > 2.0:
+        return 100.0
+    if ratio >= 1.0:
+        return 70.0
+    return 40.0
+
+
+def _scarcity_subscore_from_irreplaceability(customer_irreplaceability: Optional[Any]) -> Optional[float]:
+    """客户切换成本/不可替代性子分；支持人工数值或标签，不自动臆造。"""
+    if customer_irreplaceability is None:
+        return None
+    if isinstance(customer_irreplaceability, (int, float)):
+        return max(0.0, min(100.0, float(customer_irreplaceability)))
+    label = str(customer_irreplaceability).strip().lower()
+    if label in {"unique", "global_unique", "domestic_unique", "唯一", "全球唯一", "国内唯一"}:
+        return 100.0
+    if label in {"2-3", "2_3", "2-3家", "oligopoly", "寡头", "少数几家"}:
+        return 70.0
+    if label in {"competitive", "充分竞争", "可替代", "weak"}:
+        return 30.0
+    return 50.0
+
+
+def calc_scarcity_score(
+    domestic_substitution_slope: Optional[float] = None,
+    replacement_cost_to_mcap: Optional[float] = None,
+    customer_irreplaceability: Optional[Any] = None,
+) -> tuple[float, str]:
+    """v3.0 稀缺性评分 skeleton：三子指标缺失时各自按中性50计分。"""
+    raw_subs = [
+        ("国产替代率提升斜率", _scarcity_subscore_from_slope(domestic_substitution_slope)),
+        ("重置成本/市值比", _scarcity_subscore_from_replacement_cost(replacement_cost_to_mcap)),
+        ("客户切换成本/不可替代性", _scarcity_subscore_from_irreplaceability(customer_irreplaceability)),
+    ]
+    subs = [(name, 50.0 if score is None else score) for name, score in raw_subs]
+    missing = [name for name, score in raw_subs if score is None]
+    score = round(sum(score for _, score in subs) / len(subs), 1)
+    note = "稀缺性=" + ";".join(f"{name}{score:.0f}" for name, score in subs)
+    if missing:
+        note += " | 缺失按中性50:" + ",".join(missing)
+    return score, note
+
+def _scarcity_premium(scarcity_tier: Optional[Any]) -> tuple[float, str]:
+    if scarcity_tier is None:
+        return 0.0, "充分竞争/未标注"
+    if isinstance(scarcity_tier, (int, float)):
+        val = float(scarcity_tier)
+        if val >= 90: return 1.50, "唯一(数值映射)"
+        if val >= 70: return 0.80, "2-3家(数值映射)"
+        if val >= 55: return 0.40, "5家以内(数值映射)"
+        return 0.0, "充分竞争(数值映射)"
+    label = str(scarcity_tier).strip()
+    return SCARCITY_PREMIUMS.get(label, SCARCITY_PREMIUMS.get(label.lower(), 0.0)), label
+
+
+def _score_q(
+    roe: Optional[float],
+    gross_margin: Optional[float],
+    debt_ratio: Optional[float],
+    domestic_substitution_slope: Optional[float] = None,
+    replacement_cost_to_mcap: Optional[float] = None,
+    customer_irreplaceability: Optional[Any] = None,
+    scarcity_score: Optional[float] = None,
+) -> tuple[float, str]:
     """
     Q 质量因子评分（0-100）。
-    核心指标：ROE + 毛利率 + 资产负债率
+
+    v3.0 = 财务质量(60%) + 稀缺性评分(40%)。稀缺性三子指标无法
+    自动获取时不伪造，回落历史财务质量并在 note 标注 MANUAL_REQUIRED。
     """
-    score = 50.0
+    financial_score = 50.0
     notes = []
 
     if roe is not None:
-        if roe >= 25:   score += 25; notes.append(f"ROE={roe:.1f}%优秀")
-        elif roe >= 15: score += 15; notes.append(f"ROE={roe:.1f}%良好")
-        elif roe >= 10: score += 5;  notes.append(f"ROE={roe:.1f}%一般")
-        else:           score -= 10; notes.append(f"ROE={roe:.1f}%偏低")
+        if roe >= 25:   financial_score += 25; notes.append(f"ROE={roe:.1f}%优秀")
+        elif roe >= 15: financial_score += 15; notes.append(f"ROE={roe:.1f}%良好")
+        elif roe >= 10: financial_score += 5;  notes.append(f"ROE={roe:.1f}%一般")
+        else:           financial_score -= 10; notes.append(f"ROE={roe:.1f}%偏低")
 
     if gross_margin is not None:
-        if gross_margin >= 50:   score += 15; notes.append(f"毛利率={gross_margin:.1f}%高")
-        elif gross_margin >= 30: score += 8;  notes.append(f"毛利率={gross_margin:.1f}%中")
-        elif gross_margin >= 15: score += 2;  notes.append(f"毛利率={gross_margin:.1f}%低")
-        else:                    score -= 5;  notes.append(f"毛利率={gross_margin:.1f}%很低")
+        if gross_margin >= 50:   financial_score += 15; notes.append(f"毛利率={gross_margin:.1f}%高")
+        elif gross_margin >= 30: financial_score += 8;  notes.append(f"毛利率={gross_margin:.1f}%中")
+        elif gross_margin >= 15: financial_score += 2;  notes.append(f"毛利率={gross_margin:.1f}%低")
+        else:                    financial_score -= 5;  notes.append(f"毛利率={gross_margin:.1f}%很低")
 
     if debt_ratio is not None:
-        if debt_ratio <= 30:   score += 10; notes.append(f"负债率={debt_ratio:.1f}%健康")
-        elif debt_ratio <= 50: score += 5;  notes.append(f"负债率={debt_ratio:.1f}%一般")
-        elif debt_ratio <= 70: score -= 5;  notes.append(f"负债ratio={debt_ratio:.1f}%偏高")
-        else:                  score -= 15; notes.append(f"负债率={debt_ratio:.1f}%危险")
+        if debt_ratio <= 30:   financial_score += 10; notes.append(f"负债率={debt_ratio:.1f}%健康")
+        elif debt_ratio <= 50: financial_score += 5;  notes.append(f"负债率={debt_ratio:.1f}%一般")
+        elif debt_ratio <= 70: financial_score -= 5;  notes.append(f"负债率={debt_ratio:.1f}%偏高")
+        else:                  financial_score -= 15; notes.append(f"负债率={debt_ratio:.1f}%危险")
 
-    score = max(0, min(100, score))
-    return score, " | ".join(notes) if notes else "质量数据不足"
+    financial_score = max(0.0, min(100.0, financial_score))
+
+    if scarcity_score is None:
+        scarcity_score, scarcity_note = calc_scarcity_score(
+            domestic_substitution_slope=domestic_substitution_slope,
+            replacement_cost_to_mcap=replacement_cost_to_mcap,
+            customer_irreplaceability=customer_irreplaceability,
+        )
+    else:
+        scarcity_score = max(0.0, min(100.0, float(scarcity_score)))
+        scarcity_note = f"稀缺性={scarcity_score:.0f}(外部传入)"
+
+    if scarcity_score is None:
+        score = financial_score
+        notes.append(scarcity_note)
+    else:
+        score = financial_score * 0.60 + scarcity_score * 0.40
+        notes.append(scarcity_note)
+
+    score = max(0.0, min(100.0, score))
+    return round(score, 1), " | ".join(n for n in notes if n) if notes else "质量数据不足"
 
 
 def _score_v(pe_ttm: Optional[float],
              pb: Optional[float],
              g_adjusted_pct: Optional[float],
-             regime: str) -> tuple[float, str]:
-    """
-    V 估值因子评分（0-100）。
-    核心：PEG_adjusted，对照当前市场状态阈值
-    """
+             regime: str,
+             industry_code: Optional[Any] = None,
+             scarcity_tier: Optional[Any] = None,
+             industry_avg_pe: Optional[float] = None) -> tuple[float, str]:
+    """V 估值因子评分（0-100）：PEG轨 + 科技制造稀缺性溢价轨。"""
     if pe_ttm is None or pe_ttm <= 0:
         return 50.0, "PE数据缺失，给中性分"
 
-    thresholds = PEG_THRESHOLDS.get(regime, PEG_THRESHOLDS["neutral"])
+    canonical_regime = normalize_regime(regime)
+    thresholds = PEG_THRESHOLDS.get(canonical_regime, PEG_THRESHOLDS["neutral"])
+    code = str(industry_code).strip() if industry_code is not None else None
+    pb_value = pb if pb is not None else 0
+    use_scarcity = code in SCARCE_TECH_MANUFACTURING_CODES and code not in CONSUMER_MEDICAL_INDUSTRY_CODES and pb_value >= 5
 
-    if g_adjusted_pct and g_adjusted_pct > 0:
-        peg = pe_ttm / g_adjusted_pct
-        if peg <= thresholds["good"]:    score, note = 90, f"PEG={peg:.2f}≤{thresholds['good']}极优"
-        elif peg <= thresholds["ok"]:    score, note = 75, f"PEG={peg:.2f}合理"
-        elif peg <= thresholds["max"]:   score, note = 55, f"PEG={peg:.2f}偏贵"
-        else:                            score, note = 25, f"PEG={peg:.2f}>{thresholds['max']}超贵"
+    if use_scarcity:
+        premium, premium_label = _scarcity_premium(scarcity_tier)
+        base_pe = industry_avg_pe if industry_avg_pe and industry_avg_pe > 0 else max(pe_ttm, 25.0)
+        fair_pe = base_pe * (1 + premium)
+        ratio = pe_ttm / fair_pe if fair_pe > 0 else 1.0
+        if ratio <= 0.70: score, level = 90, "显著低于稀缺性合理PE"
+        elif ratio <= 1.00: score, level = 78, "低于/接近稀缺性合理PE"
+        elif ratio <= 1.20: score, level = 60, "略高于稀缺性合理PE"
+        elif ratio <= 1.50: score, level = 40, "明显高于稀缺性合理PE"
+        else: score, level = 20, "稀缺性溢价后仍过贵"
+        note = (f"稀缺性溢价模型: 行业代码{code}, PB={pb_value:.1f}, 稀缺层级={premium_label}, "
+                f"合理PE={fair_pe:.1f}x(行业{base_pe:.1f}×{1+premium:.1f}), 当前PE/合理PE={ratio:.2f}，{level}")
     else:
-        # 无成长数据，仅用 PE 绝对值打分
-        if pe_ttm <= 15:     score, note = 85, f"PE={pe_ttm:.1f}低估"
-        elif pe_ttm <= 25:   score, note = 70, f"PE={pe_ttm:.1f}合理"
-        elif pe_ttm <= 40:   score, note = 50, f"PE={pe_ttm:.1f}偏贵"
-        elif pe_ttm <= 60:   score, note = 30, f"PE={pe_ttm:.1f}较贵"
-        else:                score, note = 15, f"PE={pe_ttm:.1f}昂贵"
+        if g_adjusted_pct and g_adjusted_pct > 0:
+            peg = pe_ttm / g_adjusted_pct
+            if peg <= thresholds["good"]: score, note = 90, f"PEG={peg:.2f}≤{thresholds['good']}极优"
+            elif peg <= thresholds["ok"]: score, note = 75, f"PEG={peg:.2f}合理"
+            elif peg <= thresholds["max"]: score, note = 55, f"PEG={peg:.2f}偏贵"
+            else: score, note = 25, f"PEG={peg:.2f}>{thresholds['max']}超贵"
+        else:
+            if pe_ttm <= 15: score, note = 85, f"PE={pe_ttm:.1f}低估"
+            elif pe_ttm <= 25: score, note = 70, f"PE={pe_ttm:.1f}合理"
+            elif pe_ttm <= 40: score, note = 50, f"PE={pe_ttm:.1f}偏贵"
+            elif pe_ttm <= 60: score, note = 30, f"PE={pe_ttm:.1f}较贵"
+            else: score, note = 15, f"PE={pe_ttm:.1f}昂贵"
+        if code:
+            track = "消费/医药PEG轨" if code in CONSUMER_MEDICAL_INDUSTRY_CODES else "PEG轨"
+            note = f"{track}(行业代码{code}): {note}"
 
-    # PB 辅助加减分
     if pb is not None:
-        if pb < 1:    score = min(100, score + 5)
+        if pb < 1: score = min(100, score + 5)
         elif pb > 10: score = max(0, score - 5)
-
+    if canonical_regime == "bubble" and g_adjusted_pct and g_adjusted_pct > 0:
+        peg_for_brake = pe_ttm / g_adjusted_pct
+        if peg_for_brake > 2.0:
+            score = min(score, 30)
+            note += f" | 状态5b过热刹车: PEG={peg_for_brake:.2f}>2.0"
     return float(score), note
-
 
 def _score_m(momentum_6m_pct: Optional[float],
              fund_flow_signal: Optional[str],
@@ -1664,6 +1913,16 @@ def batch_garp_score(
                 roe=fin.get("roe"),
                 gross_margin=fin.get("gross_margin"),
                 debt_ratio=fin.get("debt_ratio"),
+                domestic_substitution_slope=fin.get("domestic_substitution_slope"),
+                replacement_cost_to_mcap=fin.get("replacement_cost_to_mcap"),
+                customer_irreplaceability=fin.get("customer_irreplaceability"),
+                scarcity_score=fin.get("scarcity_score"),
+                industry_code=fin.get("industry_code") or stock.get("industry_code"),
+                scarcity_tier=fin.get("scarcity_tier"),
+                industry_avg_pe=fin.get("industry_avg_pe"),
+                pe_percentile=fin.get("pe_percentile"),
+                erp_pct=fin.get("erp_pct"),
+                broad_index_1m_return_pct=fin.get("broad_index_1m_return_pct"),
                 momentum_6m_pct=fin.get("momentum_6m_pct"),
                 report_rating_trend=fin.get("report_rating_trend"),
                 mx_signal=fin.get("mx_signal"),
@@ -1721,6 +1980,16 @@ def auto_garp_score(
     roe: Optional[float] = None,
     gross_margin: Optional[float] = None,
     debt_ratio: Optional[float] = None,
+    domestic_substitution_slope: Optional[float] = None,
+    replacement_cost_to_mcap: Optional[float] = None,
+    customer_irreplaceability: Optional[Any] = None,
+    scarcity_score: Optional[float] = None,
+    industry_code: Optional[Any] = None,
+    scarcity_tier: Optional[Any] = None,
+    industry_avg_pe: Optional[float] = None,
+    pe_percentile: Optional[float] = None,
+    erp_pct: Optional[float] = None,
+    broad_index_1m_return_pct: Optional[float] = None,
     momentum_6m_pct: Optional[float] = None,
     report_rating_trend: Optional[str] = None,
     mx_signal: Optional[str] = None,
@@ -1739,6 +2008,12 @@ def auto_garp_score(
     trade_date = datetime.now().strftime("%Y-%m-%d")
     requested_regime = regime
     regime = normalize_regime(regime)
+    regime_adjustment = None
+    if is_overheat_bubble_warning(pe_percentile, erp_pct, broad_index_1m_return_pct):
+        regime = "bubble"
+        regime_adjustment = "状态5b触发：全A PE分位>90%且ERP<0.5%"
+        if broad_index_1m_return_pct is not None:
+            regime_adjustment += f"，宽基1月涨幅={broad_index_1m_return_pct:.1f}%"
     weights = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS["neutral"])
 
     # 自动获取行情
@@ -1762,7 +2037,7 @@ def auto_garp_score(
 
     if north_flow_slope is None:
         try:
-            north_flow_slope = get_north_flow_slope(code)
+            north_flow_slope = get_north_flow_slope()
         except Exception:
             north_flow_slope = None
 
@@ -1818,8 +2093,21 @@ def auto_garp_score(
 
     # 五因子打分
     g_score, g_note = _score_g_with_sector(revenue_cagr_3y, eps_cagr_3y, consensus_eps_growth, sector_quality)
-    q_score, q_note = _score_q(roe, gross_margin, debt_ratio)
-    v_score, v_note = _score_v(pe_ttm, pb, g_adjusted_pct, regime)
+    q_score, q_note = _score_q(
+        roe,
+        gross_margin,
+        debt_ratio,
+        domestic_substitution_slope=domestic_substitution_slope,
+        replacement_cost_to_mcap=replacement_cost_to_mcap,
+        customer_irreplaceability=customer_irreplaceability,
+        scarcity_score=scarcity_score,
+    )
+    v_score, v_note = _score_v(
+        pe_ttm, pb, g_adjusted_pct, regime,
+        industry_code=industry_code,
+        scarcity_tier=scarcity_tier,
+        industry_avg_pe=industry_avg_pe,
+    )
     m_score, m_note = _score_m(
         momentum_6m_pct,
         fund_flow_signal,
@@ -1858,6 +2146,18 @@ def auto_garp_score(
         else:
             mx_cross["note"] = f"⚠️ MX({mx_signal}/{mx_score:.0f}分) 与 GARP({total}分) 方向背离，需人工复核"
 
+    # 状态5b过热期估值刹车：PEG>2.0 时限制最高等级。
+    if regime == "bubble" and pe_ttm and g_adjusted_pct and g_adjusted_pct > 0 and not veto:
+        bubble_peg = pe_ttm / g_adjusted_pct
+        if bubble_peg > 2.0:
+            total = min(total, 59.9)
+            tier = "🗑️ 剔除"
+            regime_adjustment = (regime_adjustment + "；" if regime_adjustment else "") + f"状态5b估值刹车：PEG={bubble_peg:.2f}>2.0，最高限制为剔除档"
+        elif bubble_peg > 1.5:
+            total = min(total, 74.9)
+            tier = "🥈 白银"
+            regime_adjustment = (regime_adjustment + "；" if regime_adjustment else "") + f"状态5b估值刹车：PEG={bubble_peg:.2f}>1.5，最高限制为白银档"
+
     # R < 90 强制风险披露
     risk_disclosure = None
     if r_score < 90 and not veto:
@@ -1894,6 +2194,7 @@ def auto_garp_score(
         "name": tc_data.get("name", ""),
         "regime": regime,
         "requested_regime": requested_regime,
+        "regime_adjustment": regime_adjustment,
         "scores": {"G": g_score, "Q": q_score, "V": v_score, "M": m_score, "R": r_score},
         "weights": {k: f"{v*100:.0f}%" for k, v in weights.items()},
         "factor_notes": {"G": g_note, "Q": q_note, "V": v_note, "M": m_note, "R": r_note},
@@ -1905,6 +2206,8 @@ def auto_garp_score(
         "recommendation": recommendation,
         "data_snapshot": {
             "pe_ttm": pe_ttm, "pb": pb,
+            "industry_code": industry_code, "scarcity_tier": scarcity_tier,
+            "industry_avg_pe": industry_avg_pe,
             "fund_flow": fund_flow_signal,
             "lockup_risk": lockup_risk,
             "dragon_tiger": dragon_tiger_signal,
