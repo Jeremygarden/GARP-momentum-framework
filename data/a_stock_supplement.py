@@ -926,17 +926,30 @@ def _score_v(pe_ttm: Optional[float],
 
 def _score_m(momentum_6m_pct: Optional[float],
              fund_flow_signal: Optional[str],
-             report_rating_trend: Optional[str]) -> tuple[float, str]:
+             report_rating_trend: Optional[str],
+             north_flow_slope: Optional[float] = None,
+             industry_chain_score: Optional[float] = None,
+             ) -> tuple[float, str]:
     """
     M 动量因子评分（0-100）。
-    价格动量(6M超额收益) × 55% + 资金流信号 × 25% + 研报评级趋势 × 20%
+
+    v3.0 三层结构（2026-06-14 升级）：
+      价格动量(6M超额收益)       × 35%  （原55%→降）
+      资金流动量(主力+北向联动)   × 35%  （原25%→升，内容升级）
+      产业链传导动量             × 30%  （原研报20%→替换）
+
+    资金流层内部：
+      主力净流入信号(东财push2当日)   × 50%
+      北向20日净流入斜率              × 50%
+
+    产业链传导层（当无实时数据时回落到研报评级趋势兼容模式）。
     """
     notes = []
     price_score = 50.0
     flow_score = 50.0
-    report_score = 50.0
+    chain_score = 50.0
 
-    # 价格动量（6M，相对大盘超额收益）
+    # ── 层¹：价格动量（6M，相对大盘超额收益）──
     if momentum_6m_pct is not None:
         if momentum_6m_pct >= 30:    price_score = 95; notes.append(f"6M超额+{momentum_6m_pct:.1f}%强势")
         elif momentum_6m_pct >= 15:  price_score = 80; notes.append(f"6M超额+{momentum_6m_pct:.1f}%好")
@@ -945,17 +958,41 @@ def _score_m(momentum_6m_pct: Optional[float],
         elif momentum_6m_pct >= -15: price_score = 35; notes.append(f"6M超额{momentum_6m_pct:.1f}%偏弱")
         else:                        price_score = 15; notes.append(f"6M超额{momentum_6m_pct:.1f}%弱势")
 
-    # 资金流信号（来自东财 push2）
-    if fund_flow_signal == "bullish":   flow_score = 85; notes.append("主力资金净流入")
-    elif fund_flow_signal == "bearish": flow_score = 20; notes.append("主力资金净流出")
-    elif fund_flow_signal == "neutral": flow_score = 50
+    # ── 层²：资金流动量（主力净流入 + 北向斜率）──
+    main_flow_score = 50.0
+    north_flow_score = 50.0
 
-    # 研报评级趋势
-    if report_rating_trend == "upgrade":   report_score = 85; notes.append("研报评级上调")
-    elif report_rating_trend == "downgrade": report_score = 20; notes.append("研报评级下调")
-    elif report_rating_trend == "stable":    report_score = 55
+    # 子层¹：主力资金（东财push2当日流入）
+    if fund_flow_signal == "bullish":   main_flow_score = 85; notes.append("主力资金净流入")
+    elif fund_flow_signal == "bearish": main_flow_score = 20; notes.append("主力资金净流出")
+    elif fund_flow_signal == "neutral": main_flow_score = 50
 
-    m_score = price_score * 0.55 + flow_score * 0.25 + report_score * 0.20
+    # 子层²：北向资金20日净流入斜率（亿元/天）
+    if north_flow_slope is not None:
+        if north_flow_slope >= 5:     north_flow_score = 90; notes.append(f"北向加速流入+{north_flow_slope:.1f}亿/天")
+        elif north_flow_slope >= 1:   north_flow_score = 72; notes.append(f"北向持续流入+{north_flow_slope:.1f}亿/天")
+        elif north_flow_slope >= -1:  north_flow_score = 50
+        elif north_flow_slope >= -5:  north_flow_score = 30; notes.append(f"北向流出{north_flow_slope:.1f}亿/天")
+        else:                         north_flow_score = 15; notes.append(f"北向加速流出{north_flow_slope:.1f}亿/天")
+    else:
+        north_flow_score = main_flow_score  # 北向不可用时，用主力信号替代
+
+    flow_score = main_flow_score * 0.50 + north_flow_score * 0.50
+
+    # ── 层³：产业链传导动量──
+    if industry_chain_score is not None:
+        chain_score = float(industry_chain_score)
+        if chain_score >= 75: notes.append("产业链传导动量强")
+        elif chain_score >= 50: notes.append("产业链动量中性")
+        else: notes.append("产业链传导信号弱")
+    else:
+        # 产业链数据不可用：回落到研报评级趋势兼容模式
+        if report_rating_trend == "upgrade":    chain_score = 80; notes.append("研报评级上调")
+        elif report_rating_trend == "downgrade": chain_score = 20; notes.append("研报评级下调")
+        elif report_rating_trend == "stable":    chain_score = 55
+        # 无研报覆盖时保持50=中性
+
+    m_score = price_score * 0.35 + flow_score * 0.35 + chain_score * 0.30
     return round(m_score, 1), " | ".join(notes) if notes else "动量数据有限"
 
 

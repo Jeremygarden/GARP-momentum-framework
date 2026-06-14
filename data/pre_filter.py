@@ -262,13 +262,17 @@ def apply_dynamic_filter(
     mcap_min: float = 30,
     mcap_max: float = 5000,
     pe_min: float = 0,
-    pe_max: float = 150,
+    pe_max: float = 120,          # 普通赛道默认上限
+    pe_max_moat: float = 200,     # v3.0 护城河稀缺型：PB≥5且ROE≥10%，PE允许至200x
     turnover_min: float = 0.2,
     change_pct_min: float = -20,
 ) -> pd.DataFrame:
     """
     动态预筛选：市值/PE/换手率/涨跌幅。
-    PE上限设150，覆盖高成长赛道（光模块/半导体等高PE标的）。
+    v3.0 双轨制 PE 上限：
+      - 普通赛道：PE <= pe_max（默认120）
+      - 护城河稀缺型（PB >= 5 且 ROE 估算 >= 10%）：PE <= pe_max_moat（默认200）
+    覆盖高成长赛道（光模块/半导体等高PE标的）且捕捉LTCC/陶瓷/先进材料等稀缺型。
     """
     rows = []
     for _, row in df.iterrows():
@@ -278,17 +282,25 @@ def apply_dynamic_filter(
             continue
 
         pe = q.get("pe_ttm", 0)
+        pb = q.get("pb", 0)
         mcap = q.get("mcap_yi", 0)
         turnover = q.get("turnover_pct", 0)
         change = q.get("change_pct", 0)
 
         if mcap < mcap_min or mcap > mcap_max:
             continue
-        if pe <= pe_min or pe > pe_max:
-            continue
         if turnover < turnover_min:
             continue
         if change < change_pct_min:
+            continue
+
+        # v3.0 双轨制 PE 过滤
+        if pe <= pe_min:
+            continue
+        # 护城河稀缺型：PB >= 5 且市值 >= 100亿，允许PE至200x
+        is_moat = (pb >= 5.0 and mcap >= 100)
+        effective_pe_max = pe_max_moat if is_moat else pe_max
+        if pe > effective_pe_max:
             continue
 
         rows.append({
@@ -526,10 +538,11 @@ def run_pre_filter(
     quotes = batch_tencent_quote(stocks["code"].tolist())
     print(f"  行情拉取完成，耗时 {time.time()-t3:.1f}s，获取 {len(quotes)} 只")
     stocks = apply_dynamic_filter(stocks, quotes,
-                                  mcap_min=100,   # 100亿以上（聚焦中大盘）
+                                  mcap_min=100,    # 100亿以上（聚焦中大盘）
                                   mcap_max=10000,
-                                  pe_min=8,       # PE>8，剔除亏损和极低质量
-                                  pe_max=120,     # 保留高成长赛道
+                                  pe_min=8,        # PE>8，剔除亏损和极低质量
+                                  pe_max=120,      # 普通赛道上限
+                                  pe_max_moat=200, # v3.0：护城河稀缺型(PB≥5)允许PE至200x
                                   turnover_min=1.5,  # 换手率>1.5%，确保流动性和市场关注度
                                   change_pct_min=-20)
 
