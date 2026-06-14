@@ -27,9 +27,12 @@ GARP 框架数据链路补强模块 — 基于 a-stock-data V3.1
   - 港股/美股标的（如 9992.HK）继续走 yfinance，不经本模块
 """
 
+import json
+import os
 import requests
 import uuid
 import time
+import json
 from datetime import datetime, timedelta
 from typing import Optional, Any
 import pandas as pd
@@ -1148,7 +1151,130 @@ def get_north_flow_slope(code: Optional[str] = None, days: int = 20) -> Optional
     except Exception as e:
         print(f"[WARN] 北向实时资金接口不可用: {e}")
 
+    # ── 层4 fallback：本地日频缓存（每次成功获取当日数据时写入，积累20日后可计算斜率）──
+    cached_slope = get_north_flow_slope_from_cache(days=days)
+    if cached_slope is not None:
+        print(f"[INFO] 北向资金斜率来自本地缓存: {cached_slope} 亿/天")
+        return cached_slope
+
     return None
+
+
+_NORTH_FLOW_CACHE_PATH = _os.path.join(_os.path.dirname(__file__), "north_flow_cache.json")
+
+
+def _load_north_flow_cache() -> dict:
+    """加载北向资金日频缓存，格式 {日期: 亿元净流入}。"""
+    if not _os.path.exists(_NORTH_FLOW_CACHE_PATH):
+        return {}
+    try:
+        with open(_NORTH_FLOW_CACHE_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_north_flow_cache(cache: dict) -> None:
+    """持久化北向资金日频缓存，保留最近60个交易日。"""
+    try:
+        # 只保留最近60条
+        if len(cache) > 60:
+            keys = sorted(cache.keys())[-60:]
+            cache = {k: cache[k] for k in keys}
+        with open(_NORTH_FLOW_CACHE_PATH, "w") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] 北向缓存写入失败: {e}")
+
+
+def record_north_flow_today(net_flow_yi: float) -> None:
+    """
+    将今日北向净流入（亿元）写入本地缓存。
+    应在每日收盘后调用（如 cron 或 run_pre_filter 末尾）。
+    正数=净流入，负数=净流出。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    cache = _load_north_flow_cache()
+    cache[today] = round(float(net_flow_yi), 2)
+    _save_north_flow_cache(cache)
+
+
+def get_north_flow_slope_from_cache(days: int = 20) -> Optional[float]:
+    """
+    从本地缓存计算北向资金近N日净流入斜率（亿元/天）。
+    需要提前通过 record_north_flow_today() 积累数据。
+    数据不足时返回 None。
+    """
+    cache = _load_north_flow_cache()
+    if not cache:
+        return None
+    sorted_items = sorted(cache.items())  # 按日期升序
+    values = [v for _, v in sorted_items[-days:]]
+    if len(values) < 5:  # 少于5个数据点，斜率不可信
+        return None
+    slope = _linear_slope(values)
+    return round(slope, 3) if slope is not None else None
+
+
+def get_today_north_net_flow() -> Optional[float]:
+    """
+    获取今日北向资金累计净流入（亿元）。
+    使用东财 kamt.rtmin（实时分钟级）累加得到当日净流入，
+    同时写入本地缓存供 get_north_flow_slope 使用。
+    """
+    headers = {"User-Agent": UA, "Referer": "https://data.eastmoney.com/hsgtcg/"}
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        url = _push2_url("/api/qt/kamt.rtmin/get")
+        params = {
+            "fields1": "f1,f2,f3,f4",
+            "fields2": "f51,f52",
+            "ut": "b2884a393a59ad64002292a3e90d46a5",
+        }
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        d = r.json().get("data") or {}
+        # n2s = 北向资金（港资→A股）分钟净流入；s2n = 南向
+        # 格式: ["9:30,净流入额(万元)", ...] 累计值（每分钟刷新，最后一条是当日累计）
+        n2s = d.get("n2s") or []
+        if n2s:
+            last = n2s[-1]
+            parts = last.split(",")
+            if len(parts) >= 2:
+                val_wan = _to_float(parts[1])
+                if val_wan is not None:
+                    # 万元→亿元（东财 n2s 最后一条是当日港资净买入A股累计，万元单位）
+                    net_flow_yi = round(val_wan / 10000, 2)
+                    record_north_flow_today(net_flow_yi)  # 写入缓存
+                    return net_flow_yi
+    except Exception as e:
+        print(f"[WARN] 获取今日北向净流入失败: {e}")
+    # kamt.kline 备用（使用沪股通+深股通净额字段）
+    try:
+        url2 = _push2his_url("/api/qt/kamt.kline/get")
+        params2 = {"fields1": "f1,f2,f3,f4", "fields2": "f51,f52,f53,f54", "klt": "101", "lmt": "5",
+                   "ut": "b2884a393a59ad64002292a3e90d46a5"}
+        r2 = requests.get(url2, params=params2, headers=headers, timeout=10)
+        d2 = r2.json().get("data") or {}
+        hk2sh = d2.get("hk2sh") or []
+        hk2sz = d2.get("hk2sz") or []
+        net_total = 0.0
+        found_today = False
+        for lines, label in [(hk2sh, "沪"), (hk2sz, "深")]:
+            for line in lines:
+                parts = line.split(",")
+                if len(parts) >= 4 and parts[0] == today:
+                    net_wan = _to_float(parts[3])  # 第4字段=净额(万元)
+                    if net_wan is not None:
+                        net_total += net_wan
+                        found_today = True
+        if found_today:
+            net_flow_yi = round(net_total / 10000, 2)
+            record_north_flow_today(net_flow_yi)
+            return net_flow_yi
+    except Exception as e:
+        print(f"[WARN] kamt.kline 北向净流入获取失败: {e}")
+    return None
+
 
 # PEG 阈值（与 market-regime.md §6.1 对齐）
 PEG_THRESHOLDS = {
@@ -2010,9 +2136,10 @@ def auto_garp_score(
     regime, regime_adjustment = _canonical_regime(regime)
     if is_overheat_bubble_warning(pe_percentile, erp_pct, broad_index_1m_return_pct):
         regime = "bubble"
-        regime_adjustment = "状态5b触发：全A PE分位>90%且ERP<0.5%"
+        trigger_note = "状态5b触发：全A PE分位>90%且ERP<0.5%"
         if broad_index_1m_return_pct is not None:
-            regime_adjustment += f"，宽基1月涨幅={broad_index_1m_return_pct:.1f}%"
+            trigger_note += f"，宽基1月涨幅={broad_index_1m_return_pct:.1f}%"
+        regime_adjustment = (regime_adjustment + "；" if regime_adjustment else "") + trigger_note
     weights = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS["neutral"])
 
     # 自动获取行情
