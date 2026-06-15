@@ -27,12 +27,14 @@ GARP 框架数据链路补强模块 — 基于 a-stock-data V3.1
   - 港股/美股标的（如 9992.HK）继续走 yfinance，不经本模块
 """
 
+import hashlib
 import json
 import os
+import re
 import requests
+import urllib.parse
 import uuid
 import time
-import json
 from datetime import datetime, timedelta
 from typing import Optional, Any
 import pandas as pd
@@ -568,43 +570,279 @@ def compare_reports_with_miaoxiang(
 # 5. 财联社快讯（直连 cls.cn）
 # ─────────────────────────────────────────
 
-def get_cls_telegraph(page_size: int = 50) -> list[dict]:
-    """
-    财联社电报（全市场实时快讯）— 直连 cls.cn。
-    替代 Tavily 爬取方案，稳定性更高。
-    返回: [{title, content, time, stocks}]
-    stocks: 关联股票代码列表（cls 直接提供，可 JOIN 持仓）
+# ── CLS API v2 签名常量（sv 随前端版本更新，失效时修改此处）──
+CLS_SV = "8.7.9"
 
-    ⚠️ 2026-06 状态：CLS nodeapi/telegraphList 返回 404，
-    已迁移至需签名的 v1/roll/get_roll_list。本接口静默返回空列表，
-    R 因子的 CLS 子组件安全降级（不影响龙虎榜/限售解禁判断）。
+
+class ClsApiStale(Exception):
+    """CLS API 返回 errno!=0 或 roll_data 为空，说明 sv 版本号可能已过期。"""
+    pass
+
+
+def _cls_make_sign(params: dict) -> str:
+    """CLS API 签名：对参数字典按字典序拼接后 SHA1 → MD5。"""
+    sorted_items = sorted(params.items(), key=lambda x: x[0])
+    query_string = urllib.parse.urlencode(sorted_items)
+    sha1_digest = hashlib.sha1(query_string.encode("utf-8")).hexdigest()
+    return hashlib.md5(sha1_digest.encode("utf-8")).hexdigest()
+
+
+def _cls_fetch_primary(page_size: int) -> list[dict]:
+    """CLS 新版签名接口（主路）。
+
+    Raises:
+        ClsApiStale: errno != 0 或 roll_data 为空（sv 可能过期）。
+        requests.RequestException: 网络/HTTP 错误。
     """
-    url = "https://www.cls.cn/nodeapi/telegraphList"
-    params = {"rn": str(page_size), "page": "1"}
-    headers = {"User-Agent": UA, "Referer": "https://www.cls.cn/"}
+    params: dict = {
+        "appName": "CailianpressWeb",
+        "os": "web",
+        "rn": str(page_size),
+        "sv": CLS_SV,
+    }
+    params["sign"] = _cls_make_sign(params)
+    headers = {
+        "User-Agent": UA,
+        "Referer": "https://www.cls.cn/telegraph",
+        "Accept": "application/json, text/plain, */*",
+    }
+    resp = requests.get(
+        "https://www.cls.cn/v1/roll/get_roll_list", params=params, headers=headers, timeout=15
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+
+    errno = payload.get("errno", -1)
+    roll_data = (payload.get("data") or {}).get("roll_data") or []
+    if errno != 0 or not roll_data:
+        raise ClsApiStale(
+            f"CLS errno={errno}, roll_data_len={len(roll_data)}, sv={CLS_SV}"
+        )
+
+    results: list[dict] = []
+    for item in roll_data:
+        stocks: list[str] = []
+        for s in item.get("stock_list") or []:
+            code = (s.get("StockID") or s.get("StockCode") or s.get("secu_code") or "").strip()
+            digits = "".join(ch for ch in code if ch.isdigit())
+            if len(digits) >= 6:
+                stocks.append(digits[:6])
+        results.append({
+            "title": (item.get("title") or "").strip(),
+            "content": (item.get("content") or item.get("brief") or "").strip()[:300],
+            "time": item.get("ctime") or item.get("modified_time") or 0,
+            "stocks": stocks,
+        })
+    return results
+
+
+def _sina_fetch_fallback(page_size: int) -> list[dict]:
+    """新浪财经快讯 fallback（CLS 主路失败时启用）。
+
+    尝试两个接口（滚动新闻 → 直播 feed），异常静默返回 []。
+    """
+    headers = {
+        "User-Agent": UA,
+        "Referer": "https://finance.sina.com.cn/",
+        "Accept": "application/json, text/plain, */*",
+    }
+    code_re = re.compile(r"\b[036]\d{5}\b")
+
+    def _extract_stocks(text: str) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for code in code_re.findall(text or ""):
+            if code not in seen:
+                seen.add(code)
+                result.append(code)
+        return result
+
+    def _norm_time(raw) -> int | str:
+        if raw is None or raw == "":
+            return ""
+        try:
+            ts = int(raw)
+            return ts // 1000 if ts > 10_000_000_000 else ts
+        except (ValueError, TypeError):
+            return ""
+
+    def _parse_items(items: list) -> list[dict]:
+        out: list[dict] = []
+        for item in items[:page_size]:
+            if not isinstance(item, dict):
+                continue
+            title = (item.get("title") or "").strip()
+            content = str(
+                item.get("intro") or item.get("summary") or item.get("content") or ""
+            ).strip()[:300]
+            if not (title or content):
+                continue
+            out.append({
+                "title": title,
+                "content": content,
+                "time": _norm_time(item.get("ctime") or item.get("createtime")),
+                "stocks": _extract_stocks(f"{title} {content}"),
+            })
+        return out
+
+    def _try_url(url: str) -> list[dict]:
+        try:
+            resp = requests.get(url, headers=headers, timeout=8)
+            if resp.status_code != 200:
+                return []
+            text = resp.text.strip()
+            # 处理 JSONP 包装
+            if text.startswith("(") or ("(" in text[:60] and ")" in text[-5:]):
+                start, end = text.find("{"), text.rfind("}")
+                if start >= 0 and end > start:
+                    text = text[start:end + 1]
+            data = json.loads(text)
+            if not isinstance(data, dict):
+                return []
+            items = (
+                (data.get("result") or {}).get("data")
+                or data.get("data")
+                or []
+            )
+            if not isinstance(items, list):
+                return []
+            return _parse_items(items)
+        except Exception:
+            return []
+
+    result = _try_url(
+        f"https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2514&k=&num={page_size}&page=1"
+    )
+    if result:
+        return result
+    return _try_url(
+        f"https://zhibo.sina.com.cn/api/zhibo/feed?zhibo_id=152&page=1&page_size={page_size}&type=1"
+    )
+
+
+def _em_fetch_fallback(page_size: int) -> list[dict]:
+    """东方财富快讯 fallback（CLS 和新浪都失败时启用）。
+
+    异常静默返回 []。
+    """
+    headers = {
+        "User-Agent": UA,
+        "Referer": "https://www.eastmoney.com/",
+        "Accept": "application/json, text/plain, */*",
+    }
+    code_re = re.compile(r"\b[036]\d{5}\b")
+
+    def _extract_codes(*texts) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for t in texts:
+            for m in code_re.findall(str(t) if t else ""):
+                if m not in seen:
+                    seen.add(m)
+                    out.append(m)
+        return out
+
+    def _parse_show_time(s) -> int | str:
+        if not s:
+            return ""
+        try:
+            return int(time.mktime(time.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S")))
+        except Exception:
+            try:
+                return int(s)
+            except Exception:
+                return str(s)
 
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        if r.status_code != 200:
-            # API 已迁移/失效，静默返回空（不打印错误避免刷屏）
-            return []
-        d = r.json()
-        rows = []
-        for item in d.get("data", {}).get("roll_data", []):
-            # 提取关联股票代码
-            stocks = []
-            for s in item.get("stock_list", []) or []:
-                if s.get("StockCode"):
-                    stocks.append(s["StockCode"])
-            rows.append({
-                "title": item.get("title", "") or item.get("brief", ""),
-                "content": (item.get("content", "") or item.get("brief", ""))[:300],
-                "time": item.get("ctime", ""),
-                "stocks": stocks,
-            })
-        return rows
+        params = {
+            "client": "web",
+            "biz": "web_portal_symbol",
+            "fastColumn": "102",
+            "pageSize": str(max(1, int(page_size))),
+            "pageIndex": "1",
+            "order": "1",
+            "sortEnd": "",
+            "req_trace": str(int(time.time() * 1000)),
+        }
+        r = requests.get(
+            "https://np-listapi.eastmoney.com/comm/web/getFastNewsList",
+            params=params, headers=headers, timeout=10,
+        )
+        if r.status_code == 200:
+            d = r.json()
+            items = ((d.get("data") or {}).get("fastNewsList") or [])
+            rows: list[dict] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                title = (item.get("title") or "").strip()
+                summary = (item.get("summary") or item.get("digest") or "").strip()
+                # 优先使用接口直接返回的 stockList
+                api_stocks: list[str] = []
+                for s in item.get("stockList") or []:
+                    if isinstance(s, str):
+                        m = code_re.search(s)
+                        if m:
+                            api_stocks.append(m.group(0))
+                    elif isinstance(s, dict):
+                        for key in ("StockCode", "stockCode", "code", "secCode"):
+                            v = s.get(key)
+                            if v:
+                                m = code_re.search(str(v))
+                                if m:
+                                    api_stocks.append(m.group(0))
+                                    break
+                stocks = api_stocks if api_stocks else _extract_codes(title, summary)
+                # 去重保序
+                seen: set[str] = set()
+                stocks = [c for c in stocks if not (c in seen or seen.add(c))]  # type: ignore
+                rows.append({
+                    "title": title,
+                    "content": summary[:300],
+                    "time": _parse_show_time(
+                        item.get("showTime") or item.get("realSort") or ""
+                    ),
+                    "stocks": stocks,
+                })
+            if rows:
+                return rows
     except Exception:
-        return []
+        pass
+    return []
+
+
+def get_cls_telegraph(page_size: int = 50) -> list[dict]:
+    """财联社电报（全市场实时快讯），含三级 fallback。
+
+    数据链路：
+      1. CLS /api/cache（新版签名，主路）
+      2. 新浪财经滚动快讯（fallback-1）
+      3. 东方财富 fastNews（fallback-2）
+      4. 静默返回 []（全部失败时，不影响龙虎榜/限售解禁判断）
+
+    返回: [{title, content, time, stocks}]
+      stocks: 6位 A 股代码列表
+
+    sv 版本号变更时更新 CLS_SV 常量即可，无需改动此函数。
+    """
+    try:
+        return _cls_fetch_primary(page_size)
+    except ClsApiStale:
+        # sv 过期或接口结构变更 → 走 fallback
+        pass
+    except Exception:
+        # 网络/HTTP 错误 → 走 fallback
+        pass
+
+    result = _sina_fetch_fallback(page_size)
+    if result:
+        return result
+
+    result = _em_fetch_fallback(page_size)
+    if result:
+        return result
+
+    return []
 
 
 def filter_cls_by_holdings(
